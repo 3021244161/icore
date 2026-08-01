@@ -1,0 +1,80 @@
+# =============================================================================
+# icore — Database Connection Configuration
+# =============================================================================
+# Define named database connections here. Each connection maps to a single
+# database instance. The default_connection name determines which connection
+# is used when TaskContext.get_db() is called without arguments.
+#
+# Supported db_type values:
+#   - postgresql  (asyncpg driver)
+#   - mysql       (aiomysql driver)
+#   - oracle      (oracledb async driver)
+#   - hive        (pyhive, sync -> wrapped via asyncio.to_thread)
+#
+# Reference: docs/03-database-layer.md
+# =============================================================================
+
+default_connection: "main_db"            # Name of the default connection
+
+# -----------------------------------------------------------------------------
+# Named Connections
+# -----------------------------------------------------------------------------
+connections:
+
+  # --- Main PostgreSQL database ---
+  main_db:
+    db_type: "postgresql"
+    host: "localhost"
+    port: 5432
+    username: "${DB_USER}"               # Use environment variable
+    password: "${DB_PASSWORD}"
+    database: "icore"
+    pool_size: 10                        # Max concurrent connections
+    max_overflow: 20                     # Extra overflow beyond pool_size
+    pool_recycle: 3600                   # Connection recycle time (seconds)
+    extra_params:                        # Driver-specific extra parameters
+      sslmode: "prefer"
+      application_name: "icore"
+
+  # --- Oracle connection (for legacy systems) ---
+  # legacy_oracle:
+  #   db_type: "oracle"
+  #   host: "192.168.1.100"
+  #   port: 1521
+  #   username: "${ORACLE_USER}"
+  #   password: "${ORACLE_PASSWORD}"
+  #   database: "ORCLPDB1"               # Oracle service name or SID
+  #   pool_size: 5
+  #   max_overflow: 10
+  #   pool_recycle: 1800
+  #   extra_params:
+  #     encoding: "UTF-8"
+
+  # --- Hive data warehouse (analytics) ---
+  # analytics_hive:
+  #   db_type: "hive"
+  #   host: "hive-server.internal"
+  #   port: 10000
+  #   username: "${HIVE_USER}"
+  #   password: "${HIVE_PASSWORD}"
+  #   database: "analytics"
+  #   pool_size: 3                        # Hive is slower; small pool
+  #   max_overflow: 5
+  #   pool_recycle: 600
+  #   extra_params:
+  #     auth: "KERBEROS"
+  #     kerberos_service_name: "hive"
+
+  # --- MySQL (for legacy web apps) ---
+  # legacy_mysql:
+  #   db_type: "mysql"
+  #   host: "localhost"
+  #   port: 3306
+  #   username: "${MYSQL_USER}"
+  #   password: "${MYSQL_PASSWORD}"
+  #   database: "legacy_app"
+  #   pool_size: 10
+  #   max_overflow: 20
+  #   pool_recycle: 3600
+  #   extra_params:
+  #     charset: "utf8mb4"

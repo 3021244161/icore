@@ -1,0 +1,115 @@
+# =============================================================================
+# icore — Model Configuration
+# =============================================================================
+# Each model entry represents a single OpenAI-compatible LLM endpoint.
+# Models can be registered here and selected by model_id in API requests,
+# or auto-routed based on task characteristics via routing rules.
+#
+# Reference: docs/05-model-management.md
+# =============================================================================
+
+default_model_id: "gpt-4o-mini"          # Default model when none specified
+enable_auto_routing: true                 # Enable automatic model routing
+
+# -----------------------------------------------------------------------------
+# Registered Models
+# -----------------------------------------------------------------------------
+models:
+
+  # --- Example: GPT-4o (high-capability, high-cost) ---
+  gpt-4o:
+    model_name: "gpt-4o"
+    api_base: "https://api.openai.com/v1"
+    api_key: "${OPENAI_API_KEY}"           # Use env var
+    max_tokens: 16384
+    temperature: 0.7
+    request_timeout: 120
+    max_retries: 3
+    retry_delay: 1.0
+    cost_per_1k_input: 0.005               # USD
+    cost_per_1k_output: 0.015
+    enabled: true
+    tags: ["capable", "large_context"]
+
+  # --- Example: GPT-4o-mini (fast, cost-effective) ---
+  gpt-4o-mini:
+    model_name: "gpt-4o-mini"
+    api_base: "https://api.openai.com/v1"
+    api_key: "${OPENAI_API_KEY}"
+    max_tokens: 16384
+    temperature: 0.7
+    request_timeout: 60
+    max_retries: 3
+    retry_delay: 1.0
+    cost_per_1k_input: 0.00015
+    cost_per_1k_output: 0.0006
+    enabled: true
+    tags: ["cheap", "fast"]
+
+  # --- Example: Local model via Ollama ---
+  # local-llama3:
+  #   model_name: "llama3.1:8b"
+  #   api_base: "http://localhost:11434/v1"
+  #   api_key: "ollama"                    # Ollama doesn't require real key
+  #   max_tokens: 4096
+  #   temperature: 0.7
+  #   request_timeout: 300
+  #   max_retries: 1
+  #   retry_delay: 2.0
+  #   cost_per_1k_input: 0.0              # Local = free
+  #   cost_per_1k_output: 0.0
+  #   enabled: false                       # Disabled by default
+  #   tags: ["cheap", "privacy", "local"]
+
+  # --- Example: Azure OpenAI ---
+  # azure-gpt4:
+  #   model_name: "gpt-4"
+  #   api_base: "https://your-resource.openai.azure.com/"
+  #   api_key: "${AZURE_OPENAI_API_KEY}"
+  #   max_tokens: 8192
+  #   temperature: 0.5
+  #   request_timeout: 120
+  #   max_retries: 2
+  #   retry_delay: 2.0
+  #   cost_per_1k_input: 0.03
+  #   cost_per_1k_output: 0.06
+  #   enabled: false
+  #   tags: ["capable", "azure"]
+
+# -----------------------------------------------------------------------------
+# Auto-Routing Rules
+# -----------------------------------------------------------------------------
+# Rules are evaluated in order. The first matching rule's preferred_tags
+# are used to score and select a model. If no rule matches, default_model_id
+# is used.
+# -----------------------------------------------------------------------------
+
+routing_rules:
+  # Rule 1: Summarization tasks -> prefer cheap + fast models
+  - task_type: "summarize"
+    preferred_tags: ["cheap", "fast"]
+    max_cost: 0.001
+    fallback_model_id: "gpt-4o-mini"
+
+  # Rule 2: Extraction tasks -> prefer capable models
+  - task_type: "extract"
+    preferred_tags: ["capable"]
+    max_cost: 0.01
+    fallback_model_id: "gpt-4o"
+
+  # Rule 3: Generation tasks (reports, content) -> prefer capable + large_context
+  - task_type: "generate"
+    preferred_tags: ["capable", "large_context"]
+    max_cost: 0.02
+    fallback_model_id: "gpt-4o"
+
+  # Rule 4: Fallback rule for unclassified tasks -> default to cheap
+  - task_type: null                     # Matches any task type
+    preferred_tags: ["cheap"]
+    max_cost: 0.005
+    fallback_model_id: "gpt-4o-mini"
+
+# -----------------------------------------------------------------------------
+# Health Check Settings
+# -----------------------------------------------------------------------------
+health_check_interval: 60               # Seconds between health checks
