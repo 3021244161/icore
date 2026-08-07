@@ -143,3 +143,43 @@ class BaseConnector(abc.ABC):
         pool).
         """
         raise NotImplementedError
+
+    # ------------------------------------------------------------------
+    # v0.5: Optimistic-lock helper (default implementation)
+    # ------------------------------------------------------------------
+
+    async def execute_with_version(
+        self,
+        sql: str,
+        params: dict[str, Any],
+        expected_version: int,
+    ) -> int:
+        """
+        Execute an UPDATE guarded by an optimistic version check.
+
+        Caller writes SQL like::
+
+            UPDATE entities
+            SET name = :name, version = version + 1
+            WHERE id = :id AND version = :expected_version
+
+        and passes ``expected_version`` separately. The base connector
+        injects ``expected_version`` into ``params`` (if absent) and
+        delegates to ``execute()``. Returns the affected-rows count:
+        ``0`` means a version conflict (another writer committed first).
+
+        Adapters with native optimistic-lock support may override this
+        to push the check into a single server-side statement.
+
+        Note:
+            ``params`` uses named placeholders (``:name`` style) to
+            match the SQL example above. Concrete adapters that use
+            positional placeholders (``$1``, ``?``) must override this
+            method to translate the dict to their driver's expected
+            format, or supply a positional SQL string.
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not implement "
+            f"execute_with_version(); override it to enable "
+            f"optimistic locking."
+        )

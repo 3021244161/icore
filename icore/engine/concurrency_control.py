@@ -516,25 +516,8 @@ class _ConcurrencySlot:
         )
 
 
-class BackpressureError(Exception):
-    """
-    Raised when the system is under backpressure.
-
-    The API layer should catch this and return HTTP 503 with a
-    Retry-After header.
-    """
-
-    def __init__(
-        self,
-        message: str = "System is under backpressure",
-        retry_after: int = 5,
-    ) -> None:
-        """
-        Initialize the backpressure error.
-
-        Args:
-            message:     Error message.
-            retry_after: Suggested retry delay in seconds.
-        """
-        super().__init__(message)
-        self.retry_after = retry_after
+# v0.5: BackpressureError has been unified into ``icore.exceptions`` so
+# every error in the platform shares a single hierarchy (ICoreError).
+# It is re-exported here for backward-compatibility with existing
+# imports (``from icore.engine.concurrency_control import BackpressureError``).
+from icore.exceptions import BackpressureError  # noqa: E402,F401

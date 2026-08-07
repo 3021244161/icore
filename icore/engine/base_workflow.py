@@ -111,7 +111,13 @@ class BaseWorkflow(abc.ABC):
     # ------------------------------------------------------------------
 
     async def execute(
-        self, ctx: TaskContext, params: dict[str, Any]
+        self,
+        ctx: TaskContext,
+        params: dict[str, Any],
+        *,
+        execution_id: str | None = None,
+        workflow_name: str = "",
+        checkpoint: dict[str, Any] | None = None,
     ) -> BaseTaskOutput:
         """
         Execute the workflow.
@@ -129,6 +135,13 @@ class BaseWorkflow(abc.ABC):
             ctx:    TaskContext with injected dependencies (model_manager,
                     db_manager, task_id, workflow_id, etc.).
             params: Workflow input parameters (dict from API request).
+            execution_id: Optional v0.6 persistence execution ID. When
+                    provided AND the executor has a persistence_manager
+                    wired, each node's result is recorded and a checkpoint
+                    is saved after every wave (enables断点续跑).
+            workflow_name: Optional workflow name for DLQ metadata.
+            checkpoint: Optional resume checkpoint (v0.6). When provided,
+                    completed nodes from the checkpoint are skipped.
 
         Returns:
             BaseTaskOutput containing the aggregated result of the workflow.
@@ -136,8 +149,16 @@ class BaseWorkflow(abc.ABC):
         from icore.engine.executor import WorkflowExecutor
 
         dag = self.define()
-        executor = WorkflowExecutor()
-        return await executor.run(dag, ctx, params)
+        # 如果已注入带 persistence/dlq 的 executor，优先使用；否则新建
+        executor = getattr(self, "_executor", None)
+        if executor is None:
+            executor = WorkflowExecutor()
+        return await executor.run(
+            dag, ctx, params,
+            execution_id=execution_id,
+            workflow_name=workflow_name,
+            checkpoint=checkpoint,
+        )
 
     def validate(self) -> bool:
         """

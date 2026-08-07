@@ -12,6 +12,8 @@ This package provides the workflow orchestration engine for icore:
     - TaskQueue:          Async task queue (in-memory / Redis)
     - TaskInstanceManager: Manages task instance lifecycle and cleanup
     - ConcurrencyController: Global/per-workflow semaphores, backpressure, rate limiting
+    - CircuitBreaker:     Per-resource circuit breaker (CLOSED/OPEN/HALF_OPEN)
+    - v0.6 resilience:    BackoffStrategy / DeadLetterQueue / SagaWorkflow
 
 Module dependency:
     engine depends on core (BaseTask, TaskContext, models)
@@ -21,6 +23,11 @@ Module dependency:
 from __future__ import annotations
 
 from icore.engine.base_workflow import BaseWorkflow
+from icore.engine.circuit_breaker import (
+    CircuitBreaker,
+    CircuitBreakerRegistry,
+    CircuitState,
+)
 from icore.engine.concurrency_control import (
     BackpressureError,
     ConcurrencyController,
@@ -45,9 +52,49 @@ from icore.engine.registry import (
 from icore.engine.states import TaskState, WorkflowState
 from icore.engine.task_queue import QueueFullError, TaskItem, TaskQueue
 
+# v0.6: resilience components
+from icore.engine.backoff import BackoffStrategy, compute_delay, retry_with_backoff
+from icore.engine.dead_letter_queue import (
+    BaseDLQBackend,
+    DLQEntry,
+    DeadLetterQueue,
+    InMemoryDLQBackend,
+    PostgresDLQBackend,
+)
+from icore.engine.saga import SagaStep, SagaWorkflow
+
+# v0.6: multi-Agent collaboration framework
+from icore.engine.agent import (
+    AgentConfig,
+    AgentExecutionResult,
+    AgentMode,
+    AgentNodeExecutor,
+)
+
+# v0.6: full-stack backpressure + hot reload + graceful degradation
+from icore.engine.backpressure import (
+    BackpressureCoordinator,
+    BackpressureSnapshot,
+    ComponentBudget,
+    ComponentStatus,
+)
+from icore.engine.graceful_degradation import (
+    ComponentState as DegradationComponentState,
+    DegradationSnapshot,
+    DegradationState,
+    GracefulDegradationCoordinator,
+)
+from icore.engine.hot_reload import (
+    HotReloadCoordinator,
+    ReloadCallback,
+    ReloadEvent,
+)
+
 __all__ = [
     # Base workflow
     "BaseWorkflow",
+    "SagaWorkflow",
+    "SagaStep",
     # DAG
     "DAG",
     "DAGNode",
@@ -77,4 +124,34 @@ __all__ = [
     "ConcurrencyStats",
     "TokenBucket",
     "BackpressureError",
+    # Circuit breaker (v0.5)
+    "CircuitBreaker",
+    "CircuitBreakerRegistry",
+    "CircuitState",
+    # v0.6: resilience
+    "BackoffStrategy",
+    "compute_delay",
+    "retry_with_backoff",
+    "DLQEntry",
+    "BaseDLQBackend",
+    "InMemoryDLQBackend",
+    "PostgresDLQBackend",
+    "DeadLetterQueue",
+    # v0.6: multi-Agent framework
+    "AgentMode",
+    "AgentConfig",
+    "AgentExecutionResult",
+    "AgentNodeExecutor",
+    # v0.6: full-stack backpressure + hot reload + graceful degradation
+    "BackpressureCoordinator",
+    "BackpressureSnapshot",
+    "ComponentBudget",
+    "ComponentStatus",
+    "DegradationState",
+    "DegradationSnapshot",
+    "DegradationComponentState",
+    "GracefulDegradationCoordinator",
+    "HotReloadCoordinator",
+    "ReloadCallback",
+    "ReloadEvent",
 ]

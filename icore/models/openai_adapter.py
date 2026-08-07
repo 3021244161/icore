@@ -28,6 +28,7 @@ from typing import Any, AsyncIterator
 from icore.config import ModelConfig
 from icore.models.base_adapter import BaseModelAdapter
 from icore.models.exceptions import ModelAPIError
+from icore.observability import get_metrics_registry, start_span
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +109,10 @@ class OpenAICompatibleAdapter(BaseModelAdapter):
 
         Merges ModelConfig defaults with call-specific kwargs.
         Call kwargs take precedence over config defaults.
+
+        v0.6: 显式透传 ``response_format`` / ``tools`` / ``tool_choice``
+        结构化输出参数。这些参数由调用方（如 AgentNodeExecutor）传入，
+        用于强制模型按 JSON 格式输出，减少解析失败概率。
         """
         payload: dict[str, Any] = {
             "model": kwargs.pop("model_name", self.config.model_name),
@@ -117,6 +122,10 @@ class OpenAICompatibleAdapter(BaseModelAdapter):
         }
         if stream:
             payload["stream"] = True
+        # v0.6: 显式提取结构化输出参数（避免被其他 kwargs 覆盖）。
+        for _structured_key in ("response_format", "tools", "tool_choice"):
+            if _structured_key in kwargs:
+                payload[_structured_key] = kwargs.pop(_structured_key)
         # Merge any remaining kwargs (top_p, frequency_penalty, etc.)
         payload.update(kwargs)
         return payload
@@ -222,24 +231,52 @@ class OpenAICompatibleAdapter(BaseModelAdapter):
                 )
             return resp.json()
 
-        data = await self._retry_async(_do_request)
+        # v0.6 可观测性：tracer span + token / error 指标
+        with start_span("model.call") as _span:
+            _span.set_attribute("model_id", self.model_id)
+            try:
+                data = await self._retry_async(_do_request)
+            except Exception:
+                try:
+                    get_metrics_registry().get_counter(
+                        "icore_model_errors_total"
+                    ).inc(model_id=self.model_id)
+                except Exception:  # noqa: BLE001 - metrics 不得影响核心逻辑
+                    pass
+                raise
 
-        # Normalize to unified format
-        choice = data.get("choices", [{}])[0]
-        message = choice.get("message", {})
-        usage = data.get("usage", {})
+            # Normalize to unified format
+            choice = data.get("choices", [{}])[0]
+            message = choice.get("message", {})
+            usage = data.get("usage", {})
+            prompt_tokens = usage.get("prompt_tokens", 0)
+            completion_tokens = usage.get("completion_tokens", 0)
 
-        return {
-            "content": message.get("content", ""),
-            "role": message.get("role", "assistant"),
-            "model": data.get("model", self.config.model_name),
-            "usage": {
-                "prompt_tokens": usage.get("prompt_tokens", 0),
-                "completion_tokens": usage.get("completion_tokens", 0),
-                "total_tokens": usage.get("total_tokens", 0),
-            },
-            "finish_reason": choice.get("finish_reason", "stop"),
-        }
+            _span.set_attribute("prompt_tokens", prompt_tokens)
+            _span.set_attribute("completion_tokens", completion_tokens)
+
+            try:
+                _reg = get_metrics_registry()
+                _reg.get_counter("icore_model_tokens_total").inc(
+                    model_id=self.model_id, type="prompt", n=prompt_tokens
+                )
+                _reg.get_counter("icore_model_tokens_total").inc(
+                    model_id=self.model_id, type="completion", n=completion_tokens
+                )
+            except Exception:  # noqa: BLE001 - metrics 不得影响核心逻辑
+                pass
+
+            return {
+                "content": message.get("content", ""),
+                "role": message.get("role", "assistant"),
+                "model": data.get("model", self.config.model_name),
+                "usage": {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": usage.get("total_tokens", 0),
+                },
+                "finish_reason": choice.get("finish_reason", "stop"),
+            }
 
     async def stream_chat(
         self,

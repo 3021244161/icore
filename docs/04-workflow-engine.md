@@ -816,19 +816,42 @@ API 层是工作流引擎的主要消费者：
 - 实体提取：多 Task + 子工作流
 - 周报生成：数据库查询 Task + LLM 生成 Task
 
+### 11.7 v0.6 工程增强组件集成
+
+v0.6 在工作流引擎中新增 9 个工程增强组件（详见 [docs/13-v0.6-implementation.md](13-v0.6-implementation.md)）：
+
+| 组件 | 文件 | 与执行器的关系 |
+|------|------|----------------|
+| Agent 协作 | `engine/agent.py` | `DAGNode(is_agent=True, agent_config=...)`，由 `AgentNodeExecutor` 在节点执行时驱动 REACT/SUPERVISOR/SWARM 循环，复用 `WorkflowExecutor` 执行 available_tasks |
+| 退避策略 | `engine/backoff.py` | `_retry_async` 在节点失败时按策略重试（CONSTANT/LINEAR/EXPONENTIAL/EXPONENTIAL_JITTER） |
+| 死信队列 | `engine/dead_letter_queue.py` | 重试耗尽后入队，可 replay 重新执行 |
+| Saga 补偿 | `engine/saga.py` | `SagaWorkflow` 基类，节点失败时按反向顺序执行 compensate 函数 |
+| 全链路背压 | `engine/backpressure.py` | `BackpressureCoordinator` 守护每个外部依赖并发；执行器在调用 LLM/Milvus/Neo4j 前后 acquire/release |
+| 配置热加载 | `engine/hot_reload.py` | `HotReloadCoordinator` 监听 `models.yaml` 变化，重载 `ModelManager`（不影响 in-flight 执行） |
+| 优雅降级 | `engine/graceful_degradation.py` | `GracefulDegradationCoordinator` 主备 provider 切换；执行器通过 `coord.get(name)` 拿当前可用 provider |
+| objectstore 传递 | - | `WorkflowExecutor` 创建子上下文时检查 `parent_ctx.has_objectstore()` 并传递（详见 [AGENTS.md §4.7](../AGENTS.md)） |
+| 持久化 | `icore/persistence/` | 每完成一个节点写入 `task_executions` + checkpoint，支持断点续跑 |
+
 ---
 
 ## 附录：模块文件清单
 
 | 文件 | 核心内容 |
 |------|---------|
-| `icore/engine/__init__.py` | 包初始化，导出所有引擎组件 |
+| `icore/engine/__init__.py` | 包初始化，导出所有引擎组件（含 v0.6 弹性 / Agent / 治理组件） |
 | `icore/engine/states.py` | `TaskState`、`WorkflowState` 枚举（含 SKIPPED） |
-| `icore/engine/dag.py` | `DAG`、`DAGNode`、`DAGEdge`、环检测、拓扑排序、执行波 |
+| `icore/engine/dag.py` | `DAG`、`DAGNode`（含 `is_agent`/`agent_config`，v0.6）、`DAGEdge`、环检测、拓扑排序、执行波 |
 | `icore/engine/base_workflow.py` | `BaseWorkflow` 抽象基类（define/execute/validate） |
-| `icore/engine/executor.py` | `WorkflowExecutor` 运行时执行器 |
+| `icore/engine/executor.py` | `WorkflowExecutor` 运行时执行器（v0.6 起传递 objectstore 到子上下文） |
 | `icore/engine/registry.py` | `WorkflowRegistry` + `register_workflow` 装饰器 |
+| `icore/engine/agent.py`（v0.6） | `AgentNodeExecutor` + `AgentConfig` + `AgentMode`（REACT/SUPERVISOR/SWARM） |
+| `icore/engine/backoff.py`（v0.6） | `BackoffStrategy` 4 种策略 + `retry_with_backoff` |
+| `icore/engine/dead_letter_queue.py`（v0.6） | `DeadLetterQueue` + `InMemoryDLQBackend` / `PostgresDLQBackend` |
+| `icore/engine/saga.py`（v0.6） | `SagaWorkflow` + `SagaStep` 补偿事务 |
+| `icore/engine/backpressure.py`（v0.6） | `BackpressureCoordinator` 全链路背压 |
+| `icore/engine/hot_reload.py`（v0.6） | `HotReloadCoordinator` 配置热加载（watchdog/polling） |
+| `icore/engine/graceful_degradation.py`（v0.6） | `GracefulDegradationCoordinator` 优雅降级 |
 
 ---
 
-> **本文档定义了 icore 平台的工作流引擎设计，包括 DAG 调度、执行器、状态机、子工作流嵌套和条件分支。所有后续模块（API 层、并发处理、服务暴露、示例工作流）均基于本文档定义的 `BaseWorkflow`、`WorkflowExecutor` 和 `WorkflowRegistry` 进行集成。**
+> **本文档定义了 icore 平台的工作流引擎设计，包括 DAG 调度、执行器、状态机、子工作流嵌套和条件分支。所有后续模块（API 层、并发处理、服务暴露、示例工作流）均基于本文档定义的 `BaseWorkflow`、`WorkflowExecutor` 和 `WorkflowRegistry` 进行集成。v0.6 在此基础上扩展了 Agent 协作、结构化弹性、全链路背压、配置热加载与优雅降级。**

@@ -175,6 +175,62 @@ class BaseModelAdapter(abc.ABC):
         ...
 
     # ------------------------------------------------------------------
+    # v0.5: Multimodal extensions (default to "not supported")
+    # ------------------------------------------------------------------
+
+    @property
+    def supports_vision(self) -> bool:
+        """Whether this adapter accepts image inputs. Default False."""
+        return False
+
+    @property
+    def supports_audio(self) -> bool:
+        """Whether this adapter accepts audio inputs. Default False."""
+        return False
+
+    async def chat_with_media(
+        self,
+        prompt: str,
+        media_files: list[Any],
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """
+        Multimodal chat completion.
+
+        Args:
+            prompt:       User text prompt.
+            media_files:  List of ``MediaFile`` instances.
+            **kwargs:     Additional API parameters.
+
+        Raises:
+            NotImplementedError: If the model does not support vision.
+        """
+        raise NotImplementedError(
+            f"Model '{self.model_id}' does not support multimodal input"
+        )
+
+    async def embed_multimodal(
+        self,
+        inputs: list[Any],
+    ) -> list[list[float]]:
+        """
+        Multimodal embedding (e.g. CLIP image/text alignment).
+
+        Default implementation delegates text inputs to ``embed()``
+        and rejects media inputs.
+        """
+        text_inputs: list[str] = []
+        for item in inputs:
+            if isinstance(item, str):
+                text_inputs.append(item)
+            else:
+                raise NotImplementedError(
+                    f"Model '{self.model_id}' does not support "
+                    f"multimodal embedding (input type: {type(item).__name__})"
+                )
+        return await self.embed(text_inputs)
+
+    # ------------------------------------------------------------------
     # Utility
     # ------------------------------------------------------------------
 

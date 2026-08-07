@@ -44,6 +44,7 @@ from icore.core.task_context import TaskContext
 from icore.engine.concurrency_control import BackpressureError
 from icore.engine.registry import WorkflowRegistry
 from icore.engine.states import TaskState
+from icore.exceptions import ICoreError
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,23 @@ def create_app(
     concurrency_controller: Any = None,
     task_queue: Any = None,
     instance_manager: Any = None,
+    vectorstore: Any = None,
+    graphstore: Any = None,
+    media_processor: Any = None,
+    lock: Any = None,
+    circuit_breaker_registry: Any = None,
+    objectstore: Any = None,
+    idempotency_cache: Any = None,
+    backpressure_coordinator: Any = None,
+    hot_reload_coordinator: Any = None,
+    degradation_coordinator: Any = None,
+    auth_dependency: Any = None,
+    auth_bundle: Any = None,
+    persistence_manager: Any = None,
+    dlq: Any = None,
+    metrics_registry: Any = None,
+    security_injection_detector: Any = None,
+    pii_detector: Any = None,
 ) -> FastAPI:
     """
     Create and configure the icore FastAPI application.
@@ -64,7 +82,10 @@ def create_app(
         - CORS middleware
         - Exception handlers (KeyError, ValueError, generic Exception)
         - Application state (model_manager, db_manager, callback_manager,
-          concurrency_controller, task_queue, instance_manager)
+          concurrency_controller, task_queue, instance_manager,
+          vectorstore, graphstore, media_processor, lock,
+          circuit_breaker_registry, idempotency_cache,
+          v0.6 backpressure / hot-reload / degradation coordinators)
         - Two endpoints: GET /health and POST /invoke
 
     Args:
@@ -85,6 +106,36 @@ def create_app(
         instance_manager:      Optional TaskInstanceManager. When provided,
                               every invocation is registered, deduplicated,
                               and tracked through its lifecycle states.
+        vectorstore:           Optional BaseVectorStore (v0.5). Injected
+                              into TaskContext for RAG / similarity search.
+        graphstore:            Optional BaseGraphStore (v0.5). Injected
+                              into TaskContext for knowledge-graph ops.
+        media_processor:       Optional MediaProcessorRegistry (v0.5).
+                              Injected into TaskContext for multimodal
+                              file processing.
+        lock:                  Optional BaseDistributedLock (v0.5).
+                              Injected into TaskContext for serializing
+                              concurrent modifications.
+        circuit_breaker_registry: Optional CircuitBreakerRegistry (v0.5).
+                              Injected into TaskContext for per-model
+                              breaker access. Defaults to the registry
+                              owned by ModelManager when None.
+        idempotency_cache:     Optional BaseIdempotencyCache (v0.5). When
+                              wired, ``/invoke`` short-circuits repeated
+                              requests carrying the same idempotency_key.
+        backpressure_coordinator: Optional BackpressureCoordinator (v0.6).
+                              When wired, ``/health`` reports per-component
+                              saturation and ``/invoke`` returns HTTP 503
+                              under cross-component backpressure.
+        hot_reload_coordinator: Optional HotReloadCoordinator (v0.6).
+                              The coordinator is started/stopped by the
+                              bootstrap layer; the app only holds a
+                              reference for graceful shutdown.
+        degradation_coordinator: Optional GracefulDegradationCoordinator
+                              (v0.6). When wired, ``/health`` reports
+                              per-component degradation state and
+                              ``/invoke`` returns HTTP 503 when any
+                              required component is UNAVAILABLE.
 
     Returns:
         A configured FastAPI application instance.
@@ -123,6 +174,36 @@ def create_app(
     app.state.concurrency_controller = concurrency_controller
     app.state.task_queue = task_queue
     app.state.instance_manager = instance_manager
+    # v0.5 new components.
+    app.state.vectorstore = vectorstore
+    app.state.graphstore = graphstore
+    app.state.media_processor = media_processor
+    app.state.lock = lock
+    # Default to ModelManager's own registry when not explicitly supplied.
+    if circuit_breaker_registry is None and model_manager is not None:
+        cb_getter = getattr(model_manager, "get_circuit_breaker_registry", None)
+        if cb_getter is not None:
+            try:
+                circuit_breaker_registry = cb_getter()
+            except Exception:  # pragma: no cover - defensive
+                logger.warning("Failed to fetch circuit-breaker registry from ModelManager")
+    app.state.circuit_breaker_registry = circuit_breaker_registry
+    app.state.objectstore = objectstore
+    app.state.idempotency_cache = idempotency_cache
+    # v0.6 engineering enhancement coordinators.
+    app.state.backpressure_coordinator = backpressure_coordinator
+    app.state.hot_reload_coordinator = hot_reload_coordinator
+    app.state.degradation_coordinator = degradation_coordinator
+    # v0.6 module wirings (observability / auth / persistence / dlq / security)
+    app.state.auth_dependency = auth_dependency
+    app.state.auth_bundle = auth_bundle
+    app.state.persistence_manager = persistence_manager
+    app.state.dlq = dlq
+    app.state.metrics_registry = metrics_registry
+    app.state.security_injection_detector = security_injection_detector
+    # v0.6: PII 脱敏检测器（可选）。接线后 /invoke 会对 params 做脱敏，
+    #       执行完成后再对结果做 unmask 恢复。
+    app.state.pii_detector = pii_detector
     # Strong references to fire-and-forget background tasks so they are
     # not garbage-collected mid-execution (see CPython asyncio docs).
     app.state._bg_tasks: set = set()
@@ -135,6 +216,16 @@ def create_app(
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    # --- v0.6 可观测性中间件 ---
+    if metrics_registry is not None:
+        from icore.observability.middleware import (
+            MetricsMiddleware,
+            RequestIDMiddleware,
+        )
+
+        app.add_middleware(RequestIDMiddleware)
+        app.add_middleware(MetricsMiddleware, registry=metrics_registry)
 
     # --- Register exception handlers ---
     _register_exception_handlers(app)
@@ -173,6 +264,23 @@ def _register_exception_handlers(app: FastAPI) -> None:
                 "retry_after": exc.retry_after,
                 "task_id": getattr(request.state, "task_id", None),
             },
+        )
+
+    @app.exception_handler(ICoreError)
+    async def handle_icore_error(
+        request: Request, exc: ICoreError
+    ) -> JSONResponse:
+        """Handle any ICoreError subclass with a structured JSON response."""
+        headers: dict[str, str] = {}
+        if exc.retryable:
+            # BackpressureError carries its own retry_after; use a sane
+            # default for other retryable errors.
+            retry_after = getattr(exc, "retry_after", 5)
+            headers["Retry-After"] = str(retry_after)
+        return JSONResponse(
+            status_code=exc.http_status,
+            headers=headers,
+            content=exc.to_dict(getattr(request.state, "task_id", None)),
         )
 
     @app.exception_handler(KeyError)
@@ -214,8 +322,9 @@ def _register_exception_handlers(app: FastAPI) -> None:
         return JSONResponse(
             status_code=500,
             content={
-                "error": "Internal Server Error",
-                "detail": str(exc),
+                "error": "InternalServerError",
+                "code": "E-INTERNAL",
+                "detail": "An unexpected error occurred",
                 "task_id": getattr(request.state, "task_id", None),
             },
         )
@@ -225,8 +334,182 @@ def _register_exception_handlers(app: FastAPI) -> None:
 # Endpoint registration
 # ---------------------------------------------------------------------------
 
+def _is_saturated_or_degraded(components: dict[str, Any]) -> bool:
+    """v0.6 helper: inspect the backpressure / degradation snapshots.
+
+    Returns True when any component is saturated or running on a
+    fallback. Both snapshots are optional — absent sections don't
+    affect the result.
+    """
+    bp = components.get("backpressure")
+    if isinstance(bp, dict):
+        if bp.get("saturated"):
+            return True
+        comps = bp.get("components") or {}
+        for c in comps.values():
+            if isinstance(c, dict) and c.get("saturated"):
+                return True
+    deg = components.get("degradation")
+    if isinstance(deg, dict):
+        if deg.get("any_degraded"):
+            return True
+        comps = deg.get("components") or {}
+        for c in comps.values():
+            if isinstance(c, dict) and c.get("state") not in (
+                None, "primary",
+            ):
+                return True
+    return False
+
+
+def _parse_date_param(value: str | None) -> float | None:
+    """将 ISO 日期字符串或 epoch 数字字符串转换为 Unix epoch float。
+
+    支持 ISO 8601 格式（如 ``2024-01-15T10:30:00`` 或 ``2024-01-15``）
+    以及纯数字字符串（直接作为 epoch 解析）。返回 None 当输入为 None。
+    """
+    if value is None:
+        return None
+    # 尝试直接作为 epoch 数字解析
+    try:
+        return float(value)
+    except ValueError:
+        pass
+    # 尝试作为 ISO 日期解析
+    from datetime import datetime
+
+    try:
+        dt = datetime.fromisoformat(value)
+        return dt.timestamp()
+    except (ValueError, TypeError):
+        raise ValueError(
+            f"Invalid date format: '{value}'. "
+            "Expected ISO 8601 (e.g. '2024-01-15T10:30:00') or epoch number."
+        )
+
+
 def _register_endpoints(app: FastAPI, api_settings: APISettings) -> None:
-    """Register the two API endpoints."""
+    """Register the API endpoints (业务端点 + 运维端点)."""
+
+    # --- v0.6 运维端点: /metrics ---
+    if getattr(app.state, "metrics_registry", None) is not None:
+
+        @app.get(
+            "/metrics",
+            tags=["System"],
+            summary="Prometheus metrics",
+        )
+        async def metrics():
+            from icore.observability.prometheus_endpoint import (
+                prometheus_response,
+            )
+
+            return prometheus_response(app.state.metrics_registry)
+
+    # --- v0.6 运维端点: /history ---
+    if getattr(app.state, "persistence_manager", None) is not None:
+        # 当 auth_bundle 已接线时，/history 需要 ``history`` 权限
+        # （admin / developer / viewer 都有此权限）。
+        _history_deps: list = []
+        _auth_bundle = getattr(app.state, "auth_bundle", None)
+        if _auth_bundle is not None:
+            from fastapi import Depends as _Depends
+
+            _history_deps = [
+                _Depends(
+                    _auth_bundle.dependency(required_permission="history")
+                )
+            ]
+
+        @app.get(
+            "/history",
+            tags=["System"],
+            summary="Workflow execution history",
+            dependencies=_history_deps,
+        )
+        async def history(
+            workflow_name: str | None = None,
+            status: str | None = None,
+            since: str | None = None,
+            until: str | None = None,
+            limit: int = 100,
+            offset: int = 0,
+        ):
+            # limit 上限保护
+            settings = app.state.settings
+            max_limit = settings.persistence.history_max_limit
+            limit = min(limit, max_limit)
+            # 将 ISO 日期字符串转换为 Unix epoch（后端接受 float）
+            since_ts: float | None = _parse_date_param(since)
+            until_ts: float | None = _parse_date_param(until)
+            executions = await app.state.persistence_manager.get_history(
+                workflow_name=workflow_name,
+                status=status,
+                since=since_ts,
+                until=until_ts,
+                limit=limit,
+                offset=offset,
+            )
+            return {
+                "executions": [
+                    e.to_dict() if hasattr(e, "to_dict") else e
+                    for e in executions
+                ]
+            }
+
+    # --- v0.6 运维端点: /admin/dlq/* ---
+    if getattr(app.state, "dlq", None) is not None:
+        # 当 auth_bundle 已接线时，/admin/dlq/* 需要 ``admin`` 权限
+        # （仅 admin 角色有此权限）。
+        _admin_deps: list = []
+        _auth_bundle = getattr(app.state, "auth_bundle", None)
+        if _auth_bundle is not None:
+            from fastapi import Depends as _Depends
+
+            _admin_deps = [
+                _Depends(
+                    _auth_bundle.dependency(required_permission="admin")
+                )
+            ]
+
+        @app.get(
+            "/admin/dlq/list",
+            tags=["Admin"],
+            summary="List DLQ entries",
+            dependencies=_admin_deps,
+        )
+        async def dlq_list(
+            workflow_name: str | None = None, limit: int = 100
+        ):
+            entries = await app.state.dlq.list(
+                workflow_name=workflow_name, limit=limit
+            )
+            return {
+                "entries": [
+                    e.to_dict() if hasattr(e, "to_dict") else str(e)
+                    for e in entries
+                ]
+            }
+
+        @app.post(
+            "/admin/dlq/replay",
+            tags=["Admin"],
+            summary="Replay a DLQ entry",
+            dependencies=_admin_deps,
+        )
+        async def dlq_replay(entry_id: str):
+            try:
+                result = await app.state.dlq.replay(entry_id)
+                return {
+                    "status": "replayed",
+                    "entry_id": entry_id,
+                    "result": str(result),
+                }
+            except Exception as e:
+                return JSONResponse(
+                    status_code=500,
+                    content={"error": str(e), "entry_id": entry_id},
+                )
 
     @app.get(
         "/health",
@@ -239,26 +522,148 @@ def _register_endpoints(app: FastAPI, api_settings: APISettings) -> None:
         """
         Health check endpoint.
 
-        Returns system status, version, and current timestamp.
-        No parameters required.
+        v0.5: Probes each wired infrastructure component concurrently
+        and aggregates the result. The overall ``status`` is
+        ``"healthy"`` only when every probe returns healthy; otherwise
+        ``"degraded"``. Components that are not wired (e.g. when no
+        vectorstore is configured) are omitted from the response.
+
+        v0.6: Also surfaces the cross-component backpressure snapshot
+        (per-component saturation) and the graceful-degradation state
+        matrix (which components are running on their fallback). The
+        overall ``status`` is ``"degraded"`` when ANY component is
+        unhealthy, saturated, or running on a fallback provider.
+
+        Probes are intentionally **lightweight** — they verify that a
+        component is wired and reachable in-process (e.g. model manager
+        has models registered, db manager has connections registered,
+        vector/graph stores report ``health_check()`` True). They do
+        NOT perform expensive outbound calls (no real LLM API ping,
+        no DB SELECT 1) so the endpoint stays fast and safe to call
+        from liveness probes. Deep health checks are performed by the
+        background ``ModelManager.start_health_monitor()`` task and
+        surfaced via ``list_models()`` / model routing decisions.
         """
+        import asyncio
+
         settings = app.state.settings
+
+        async def _probe(name: str, obj: Any) -> tuple[str, dict[str, Any]]:
+            try:
+                # ModelManager: probe by counting registered models.
+                # Calling ``health_check_all()`` here would perform real
+                # LLM API pings which is too expensive for a liveness
+                # endpoint and would falsely mark the system degraded
+                # whenever the upstream provider is briefly unreachable.
+                if name == "model":
+                    count = len(obj)
+                    return name, {
+                        "status": "healthy" if count > 0 else "unhealthy",
+                        "registered_models": count,
+                    }
+                # DBManager: probe by counting registered connections.
+                if name == "db":
+                    names = getattr(obj, "registered_names", []) or []
+                    return name, {
+                        "status": "healthy" if names else "unhealthy",
+                        "registered_connections": len(names),
+                    }
+                # Vector / graph stores: lightweight no-arg health_check.
+                check = getattr(obj, "health_check", None)
+                if check is not None:
+                    import inspect
+
+                    sig = inspect.signature(check)
+                    required = [
+                        p
+                        for p in sig.parameters.values()
+                        if p.default is inspect.Parameter.empty
+                        and p.kind
+                        in (
+                            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                            inspect.Parameter.POSITIONAL_ONLY,
+                        )
+                    ]
+                    if not required:
+                        ok = await check()
+                        if isinstance(ok, dict):
+                            return name, {
+                                "status": "healthy" if ok.get("healthy", True) else "unhealthy",
+                                **ok,
+                            }
+                        return name, {"status": "healthy" if ok else "unhealthy"}
+                # No usable health-check method; assume healthy.
+                return name, {"status": "healthy", "wired": True}
+            except Exception as e:
+                return name, {"status": "unhealthy", "error": str(e)}
+
+        targets: list[tuple[str, Any]] = []
+        if app.state.model_manager is not None:
+            targets.append(("model", app.state.model_manager))
+        if app.state.db_manager is not None:
+            targets.append(("db", app.state.db_manager))
+        if getattr(app.state, "vectorstore", None) is not None:
+            targets.append(("vectorstore", app.state.vectorstore))
+        if getattr(app.state, "graphstore", None) is not None:
+            targets.append(("graphstore", app.state.graphstore))
+
+        results = await asyncio.gather(
+            *[_probe(n, o) for n, o in targets],
+            return_exceptions=False,
+        )
+        components: dict[str, Any] = {n: r for n, r in results}
+
+        # v0.6: append backpressure + degradation snapshots.
+        bp_coord = getattr(app.state, "backpressure_coordinator", None)
+        if bp_coord is not None:
+            try:
+                snap = await bp_coord.snapshot()
+                components["backpressure"] = snap.to_dict()
+            except Exception as e:  # pragma: no cover - defensive
+                components["backpressure"] = {
+                    "status": "unhealthy",
+                    "error": str(e),
+                }
+        deg_coord = getattr(app.state, "degradation_coordinator", None)
+        if deg_coord is not None:
+            try:
+                snap = deg_coord.snapshot()
+                components["degradation"] = snap.to_dict()
+            except Exception as e:  # pragma: no cover - defensive
+                components["degradation"] = {
+                    "status": "unhealthy",
+                    "error": str(e),
+                }
+
+        all_healthy = all(
+            isinstance(c, dict) and c.get("status") == "healthy"
+            for name, c in components.items()
+            if name not in ("backpressure", "degradation")
+        ) and not _is_saturated_or_degraded(components)
         return HealthResponse(
-            status="healthy",
+            status="healthy" if all_healthy else "degraded",
             version=settings.version,
             timestamp=datetime.now(timezone.utc).isoformat(),
+            components=components,
         )
 
-    @app.post(
-        "/invoke",
-        response_model=InvokeResponse,
-        tags=["Workflow"],
-        summary="工作流调用主接口",
-        description=(
+    # --- v0.6: /invoke 鉴权（可选）---
+    _invoke_kwargs: dict[str, Any] = {
+        "response_model": InvokeResponse,
+        "tags": ["Workflow"],
+        "summary": "工作流调用主接口",
+        "description": (
             "调用指定的工作流。传入工作流名称、参数、任务ID、"
             "回调地址、模型ID等参数。"
         ),
-    )
+    }
+    _auth_dep = getattr(app.state, "auth_dependency", None)
+    if _auth_dep is not None:
+        from fastapi import Depends
+
+        _invoke_kwargs["dependencies"] = [Depends(_auth_dep)]
+
+    @app.post("/invoke", **_invoke_kwargs)
     async def invoke(
         request: InvokeRequest,
         raw_request: Request,
@@ -293,6 +698,51 @@ def _register_endpoints(app: FastAPI, api_settings: APISettings) -> None:
         task_id = request.task_id or str(uuid.uuid4())
         raw_request.state.task_id = task_id
 
+        # 1a. v0.6: 注入检测（在幂等检查之前）
+        # 检测范围：workflow_name + params 的所有文本值（不仅限于 params dict）。
+        detector = getattr(app.state, "security_injection_detector", None)
+        if detector is not None:
+            import json as _json
+
+            # 把 workflow_name + params 合并后检测，覆盖所有用户可控字段。
+            _check_payload = {
+                "workflow_name": request.workflow_name or "",
+                "params": request.params or {},
+            }
+            text_to_check = _json.dumps(
+                _check_payload, ensure_ascii=False
+            )
+            result = await detector.detect(text_to_check)
+            if result.is_injection:
+                from icore.exceptions import PromptInjectionError
+
+                raise PromptInjectionError(
+                    f"Prompt injection detected: {result.matched_patterns}"
+                )
+
+        # 1b. Idempotency short-circuit (v0.5): when the caller supplies
+        #     an idempotency_key and a cache is wired, return the cached
+        #     response without re-executing the workflow.
+        idem_cache = getattr(app.state, "idempotency_cache", None)
+        if idem_cache is not None and request.idempotency_key:
+            cached = await idem_cache.get(request.idempotency_key)
+            if cached is not None:
+                logger.info(
+                    "Idempotency hit for key=%s, returning cached result",
+                    request.idempotency_key,
+                )
+                # Ensure the cached payload is shaped as InvokeResponse.
+                if isinstance(cached, InvokeResponse):
+                    return cached
+                if isinstance(cached, dict):
+                    return InvokeResponse(**cached)
+                # Fallback: wrap as a success response.
+                return InvokeResponse(
+                    task_id=task_id,
+                    status="success",
+                    result={"cached": True, "value": cached},
+                )
+
         # 2. Look up workflow in registry
         registry: WorkflowRegistry = app.state.workflow_registry
         try:
@@ -320,6 +770,52 @@ def _register_endpoints(app: FastAPI, api_settings: APISettings) -> None:
                     )
                 )
 
+        # v0.6: cross-component backpressure. When the coordinator
+        # reports the system as saturated (memory budget exceeded or
+        # any infrastructure component at capacity), reject with 503.
+        bp_coord = getattr(app.state, "backpressure_coordinator", None)
+        if bp_coord is not None:
+            try:
+                snap = await bp_coord.snapshot()
+                if snap.saturated:
+                    raise BackpressureError(
+                        "Cross-component backpressure saturated "
+                        "(memory_rss_mb=%.1f, components=%s)"
+                        % (
+                            snap.memory_rss_mb,
+                            [
+                                n for n, c in snap.components.items()
+                                if c.saturated
+                            ] or ["memory"],
+                        ),
+                        retry_after=10,
+                    )
+            except BackpressureError:
+                raise
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning("Backpressure snapshot failed: %s", e)
+
+        # v0.6: graceful degradation hard-fail. If a required component
+        # has degraded past UNAVAILABLE (no fallback configured), reject
+        # new invocations rather than letting workflows crash mid-flight.
+        deg_coord = getattr(app.state, "degradation_coordinator", None)
+        if deg_coord is not None:
+            try:
+                snap = deg_coord.snapshot()
+                unavailable = [
+                    n for n, c in snap.components.items()
+                    if c.state.value == "unavailable"
+                ]
+                if unavailable:
+                    raise BackpressureError(
+                        "Required components unavailable: %s" % unavailable,
+                        retry_after=30,
+                    )
+            except BackpressureError:
+                raise
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning("Degradation snapshot failed: %s", e)
+
         # 4. Register task instance (deduplicates active task_id).
         #    TaskInstanceManager.create() raises ValueError if a task
         #    with this id is already running -> 422 via handler.
@@ -343,13 +839,29 @@ def _register_endpoints(app: FastAPI, api_settings: APISettings) -> None:
             metadata=request.metadata,
         )
 
-        # 7. Inject managers from app state
+        # 7. Inject managers from app state (v0.4 + v0.5 components).
         model_manager = app.state.model_manager
         db_manager = app.state.db_manager
         if model_manager is not None:
             ctx.set_model_manager(model_manager)
         if db_manager is not None:
             ctx.set_db_manager(db_manager)
+        # v0.5 new injectables — only set when actually wired so that
+        # ``has_*()`` returns False for workflows that don't need them.
+        if getattr(app.state, "vectorstore", None) is not None:
+            ctx.set_vectorstore(app.state.vectorstore)
+        if getattr(app.state, "graphstore", None) is not None:
+            ctx.set_graphstore(app.state.graphstore)
+        if getattr(app.state, "media_processor", None) is not None:
+            ctx.set_media_processor(app.state.media_processor)
+        if getattr(app.state, "lock", None) is not None:
+            ctx.set_lock(app.state.lock)
+        cb_registry = getattr(app.state, "circuit_breaker_registry", None)
+        if cb_registry is not None:
+            ctx.set_circuit_breaker(cb_registry)
+        obj_store = getattr(app.state, "objectstore", None)
+        if obj_store is not None:
+            ctx.set_objectstore(obj_store)
 
         callback_manager = app.state.callback_manager
 
@@ -362,6 +874,59 @@ def _register_endpoints(app: FastAPI, api_settings: APISettings) -> None:
             request.callback_url is not None,
             request.model_id,
         )
+
+        # 7b. v0.6: 接入 persistence + DLQ 到 workflow 的 executor
+        persistence = getattr(app.state, "persistence_manager", None)
+        dlq_manager = getattr(app.state, "dlq", None)
+        if persistence is not None or dlq_manager is not None:
+            from icore.engine.executor import WorkflowExecutor
+
+            executor = WorkflowExecutor(
+                persistence_manager=persistence,
+                dlq=dlq_manager,
+            )
+            if hasattr(workflow, "_executor"):
+                workflow._executor = executor
+
+        # 7c. v0.6: persistence 落库（创建执行记录 + 标记 RUNNING）
+        #     resume_from：断点续跑，从已有 checkpoint 恢复执行。
+        execution_id: str | None = None
+        resume_checkpoint: dict[str, Any] | None = None
+        if request.resume_from is not None:
+            # 断点续跑模式
+            if persistence is None:
+                raise ValueError(
+                    "Cannot resume: persistence manager is not wired"
+                )
+            try:
+                resumed = await persistence.resume_execution(
+                    request.resume_from
+                )
+                execution_id = resumed.id
+                resume_checkpoint = dict(resumed.checkpoint) if resumed.checkpoint else None
+                await persistence.start_execution(execution_id)
+                logger.info(
+                    "Resuming execution %s with checkpoint: %s",
+                    execution_id,
+                    resume_checkpoint,
+                )
+            except ValueError:
+                raise
+            except Exception as e:
+                raise ValueError(
+                    f"Failed to resume execution '{request.resume_from}': {e}"
+                )
+        elif persistence is not None:
+            try:
+                exec_record = await persistence.create_execution(
+                    task_id=task_id,
+                    workflow_name=request.workflow_name,
+                    params=request.params,
+                )
+                execution_id = exec_record.id
+                await persistence.start_execution(execution_id)
+            except Exception as e:
+                logger.warning("persistence create_execution failed: %s", e)
 
         # 8. Branch on execution mode. Each branch wraps execution in
         #    the concurrency controller's acquire() context (when wired)
@@ -392,6 +957,8 @@ def _register_endpoints(app: FastAPI, api_settings: APISettings) -> None:
                     callback_manager=callback_manager,
                     controller=controller,
                     instance_manager=instance_manager,
+                    execution_id=execution_id,
+                    checkpoint=resume_checkpoint,
                 ),
                 app,
             )
@@ -411,13 +978,45 @@ def _register_endpoints(app: FastAPI, api_settings: APISettings) -> None:
                 workflow_name=request.workflow_name,
                 controller=controller,
                 instance_manager=instance_manager,
+                execution_id=execution_id,
+                checkpoint=resume_checkpoint,
             )
-            return InvokeResponse(
+            response = InvokeResponse(
                 task_id=task_id,
                 status=result.status,
                 result=result.data if result.is_success else None,
                 error=result.error,
             )
+            # v0.6: persistence 落库（完成/失败）
+            if persistence is not None and execution_id:
+                try:
+                    if result.is_success:
+                        await persistence.complete_execution(
+                            execution_id, result.data
+                        )
+                    else:
+                        await persistence.fail_execution(
+                            execution_id, result.error
+                        )
+                except Exception as e:
+                    logger.warning(
+                        "persistence complete/fail failed: %s", e
+                    )
+            # v0.5: cache successful (and explicit failure) responses
+            # under the idempotency key so retries don't re-execute.
+            if idem_cache is not None and request.idempotency_key:
+                try:
+                    await idem_cache.set(
+                        request.idempotency_key,
+                        response.model_dump(),
+                    )
+                except Exception as cache_err:  # pragma: no cover
+                    logger.warning(
+                        "Failed to cache idempotency result for key=%s: %s",
+                        request.idempotency_key,
+                        cache_err,
+                    )
+            return response
         except Exception as e:
             logger.error(
                 "Workflow execution failed: %s", e, exc_info=True
@@ -446,6 +1045,8 @@ async def _run_with_governance(
     workflow_name: str,
     controller: Any,
     instance_manager: Any,
+    execution_id: str | None = None,
+    checkpoint: dict[str, Any] | None = None,
 ) -> Any:
     """
     Execute a workflow under concurrency governance and instance tracking.
@@ -471,7 +1072,12 @@ async def _run_with_governance(
         )
 
     try:
-        result = await workflow.execute(ctx, params)
+        result = await workflow.execute(
+            ctx, params,
+            execution_id=execution_id,
+            workflow_name=workflow_name,
+            checkpoint=checkpoint,
+        )
         if instance_manager is not None:
             new_state = (
                 TaskState.COMPLETED
@@ -502,6 +1108,8 @@ async def _execute_with_callback(
     callback_manager: CallbackManager,
     controller: Any = None,
     instance_manager: Any = None,
+    execution_id: str | None = None,
+    checkpoint: dict[str, Any] | None = None,
 ) -> None:
     """
     Execute workflow in background and deliver result to callback URL.
@@ -522,6 +1130,7 @@ async def _execute_with_callback(
         callback_manager: CallbackManager instance.
         controller:       Optional ConcurrencyController.
         instance_manager: Optional TaskInstanceManager.
+        checkpoint:       Optional resume checkpoint (v0.6).
     """
     wf_name = getattr(workflow, "name", ctx.workflow_id)
     try:
@@ -532,6 +1141,8 @@ async def _execute_with_callback(
             workflow_name=wf_name,
             controller=controller,
             instance_manager=instance_manager,
+            execution_id=execution_id,
+            checkpoint=checkpoint,
         )
         payload: dict[str, Any] = {
             "task_id": ctx.task_id,

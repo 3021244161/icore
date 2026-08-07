@@ -1,0 +1,29 @@
+# Prometheus scrape configuration for icore v0.6.
+#
+# Scrapes the icore API's /metrics endpoint (exported by
+# icore.observability.prometheus_endpoint) every 15 seconds. The
+# HealthCheck and ConcurrencyController metrics are auto-instrumented
+# via the MetricsMiddleware (see icore.observability.middleware).
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: icore-local
+    env: docker
+
+scrape_configs:
+  - job_name: icore
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["icore:8000"]
+        labels:
+          service: icore-api
+
+  # Self-monitor Prometheus.
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+rule_files:
+  - /etc/prometheus/rules/*.yaml

@@ -1,0 +1,49 @@
+# icore — base compose (icore API only).
+#
+# Bring up just the API + a local SQLite/JSON-file backend for quick
+# smoke tests:
+#
+#     docker-compose -f deploy/docker-compose.yaml up -d
+#
+# For the full stack (icore + PG + Redis + Milvus + Neo4j + MinIO),
+# use docker-compose.full.yaml. For observability (Prometheus + Grafana
+# + Jaeger + Loki), use docker-compose.obs.yaml.
+
+version: "3.9"
+
+services:
+  icore:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: icore:latest
+    container_name: icore
+    ports:
+      - "8000:8000"
+    environment:
+      ICORE_API_HOST: 0.0.0.0
+      ICORE_API_PORT: 8000
+      ICORE_LOG_LEVEL: INFO
+      ICORE_CONCURRENCY_TASK_QUEUE_BACKEND: memory
+      # v0.6: keep cross-component backpressure conservative on a
+      # single-container dev setup.
+      ICORE_BACKPRESSURE_ENABLED: "true"
+      ICORE_BACKPRESSURE_MEMORY_BUDGET_MB: "1024"
+      ICORE_HOT_RELOAD_ENABLED: "true"
+      ICORE_HOT_RELOAD_USE_WATCHDOG: "true"
+      ICORE_DEGRADATION_ENABLED: "true"
+      ICORE_DEGRADATION_FAILURE_THRESHOLD: "3"
+    volumes:
+      - ../config:/app/config:ro
+      - icore-logs:/app/logs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request, sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  icore-logs:
+    driver: local

@@ -1,0 +1,18 @@
+# icore graphstore configuration
+# =============================================================================
+# Backend: "neo4j" or "memory" (default: "memory")
+#   - "memory": InMemoryGraphStore (no external deps, for dev/demo/tests)
+#   - "neo4j":  Neo4jAdapter        (requires neo4j Python driver + Neo4j server)
+# =============================================================================
+
+backend: memory
+
+# ---------------------------------------------------------------------------
+# Neo4j settings (used only when backend == "neo4j")
+# ---------------------------------------------------------------------------
+neo4j:
+  uri: ${NEO4J_URI}
+  username: ${NEO4J_USERNAME}
+  password: ${NEO4J_PASSWORD}
+  database: neo4j
+  max_connection_pool_size: 10

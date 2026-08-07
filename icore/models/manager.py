@@ -27,18 +27,23 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional
 
 from icore.config import ModelConfig, ModelSettings
-from icore.models.base_adapter import BaseModelAdapter
-from icore.models.config import ModelHealthStatus
-from icore.models.exceptions import (
+from icore.exceptions import (
+    CircuitBreakerOpenError,
+    ModelAPIError,
     ModelNotFoundError,
+    ModelTimeoutError,
     ModelUnhealthyError,
+    ModelUnsupportedError,
     NoAvailableModelError,
 )
+from icore.models.base_adapter import BaseModelAdapter
+from icore.models.config import ModelHealthStatus
 from icore.models.openai_adapter import OpenAICompatibleAdapter
 from icore.models.router import ModelRouter
+from icore.models.vision_adapter import VisionModelAdapter
 
 if TYPE_CHECKING:
     pass
@@ -157,9 +162,10 @@ class ModelManager:
     """
 
     # Adapter class registry: model_type -> adapter_class.
-    # Currently only OpenAI-compatible, but extensible for future providers.
+    # v0.5: includes "vision" for multimodal vision-capable models.
     _ADAPTER_MAP: dict[str, type[BaseModelAdapter]] = {
         "openai": OpenAICompatibleAdapter,
+        "vision": VisionModelAdapter,
     }
 
     def __init__(
@@ -182,6 +188,17 @@ class ModelManager:
         self._auto_routing: bool = True
         self._health_interval: int = 60
         self._health_check_task: Optional[asyncio.Task[None]] = None
+
+        # v0.6: 语义缓存（默认 None，不包装 adapter）
+        self._semantic_cache: Any = None
+
+        # v0.5: per-model circuit-breaker registry (lazy import to
+        # avoid an engine->models dependency cycle).
+        from icore.engine.circuit_breaker import CircuitBreakerRegistry
+
+        self._circuit_breakers: CircuitBreakerRegistry = (
+            CircuitBreakerRegistry()
+        )
 
         # Build router (it needs a reference to this manager)
         self._router = ModelRouter(self)
@@ -322,6 +339,19 @@ class ModelManager:
     # Adapter access
     # ------------------------------------------------------------------
 
+    def set_semantic_cache(self, cache: Any) -> None:
+        """注入语义缓存（v0.6）。
+
+        设置后，``get_adapter()`` 返回的 adapter 会被
+        ``CachedModelAdapter`` 包装，使 LLM 调用走缓存。
+        传 ``None`` 可清除缓存包装。
+        """
+        with self._lock:
+            self._semantic_cache = cache
+            # 清除已缓存的 adapter，使下次 get_adapter 重新创建并包装
+            if cache is not None:
+                self._adapters.clear()
+
     def get_adapter(
         self,
         model_id: Optional[str] = None,
@@ -356,28 +386,45 @@ class ModelManager:
         with self._lock:
             # Explicit model request
             if model_id is not None:
-                return self._get_or_create_adapter(model_id)
+                adapter = self._get_or_create_adapter(model_id)
+                actual_id = model_id
+            else:
+                # Auto-routing
+                if not self._auto_routing:
+                    raise NoAvailableModelError(
+                        "Auto-routing is disabled and no model_id specified"
+                    )
 
-            # Auto-routing
-            if not self._auto_routing:
-                raise NoAvailableModelError(
-                    "Auto-routing is disabled and no model_id specified"
+                selected_id = self._router.auto_route(
+                    task_type=task_type,
+                    max_cost=cost_constraint,
+                    tags=tags,
                 )
+                if selected_id is None:
+                    raise NoAvailableModelError(
+                        f"task_type={task_type}, tags={tags}"
+                    )
+                logger.info(
+                    "Auto-routed to model '%s' (task_type=%s, complexity=%s)",
+                    selected_id, task_type, complexity,
+                )
+                adapter = self._get_or_create_adapter(selected_id)
+                actual_id = selected_id
 
-            selected_id = self._router.auto_route(
-                task_type=task_type,
-                max_cost=cost_constraint,
-                tags=tags,
-            )
-            if selected_id is None:
-                raise NoAvailableModelError(
-                    f"task_type={task_type}, tags={tags}"
-                )
-            logger.info(
-                "Auto-routed to model '%s' (task_type=%s, complexity=%s)",
-                selected_id, task_type, complexity,
-            )
-            return self._get_or_create_adapter(selected_id)
+            # v0.6: 如果已注入语义缓存且该 adapter 尚未被包装，
+            #       用 CachedModelAdapter 包装并缓存。
+            if self._semantic_cache is not None:
+                from icore.cache import CachedModelAdapter
+
+                if not isinstance(adapter, CachedModelAdapter):
+                    adapter = CachedModelAdapter(
+                        adapter=adapter,
+                        cache=self._semantic_cache,
+                        model_id=actual_id,
+                    )
+                    self._adapters[actual_id] = adapter
+
+            return adapter
 
     def get_model(self, model_id: str) -> BaseModelAdapter:
         """
@@ -418,12 +465,18 @@ class ModelManager:
         if model_id in self._adapters:
             return self._adapters[model_id]
 
-        # Create adapter (default: OpenAI-compatible)
-        adapter_class = self._ADAPTER_MAP.get("openai", OpenAICompatibleAdapter)
+        # Select adapter class by config.model_type (v0.5).
+        # Defaults to OpenAI-compatible for unknown types.
+        model_type = getattr(config, "model_type", "openai") or "openai"
+        adapter_class = self._ADAPTER_MAP.get(
+            model_type, OpenAICompatibleAdapter
+        )
         adapter = adapter_class(config)
         self._adapters[model_id] = adapter
-        logger.debug("Created adapter for model '%s' (%s)",
-                     model_id, adapter_class.__name__)
+        logger.debug(
+            "Created adapter for model '%s' (type=%s, class=%s)",
+            model_id, model_type, adapter_class.__name__,
+        )
         return adapter
 
     # ------------------------------------------------------------------
@@ -675,6 +728,109 @@ class ModelManager:
                 except Exception as e:
                     logger.error("Error closing adapter: %s", e)
         logger.info("Closed all model adapters")
+
+    # ------------------------------------------------------------------
+    # v0.5: Circuit-breaker + fallback chain
+    # ------------------------------------------------------------------
+
+    async def call_with_fallback(
+        self,
+        model_id: Optional[str],
+        fn: Callable[[BaseModelAdapter], Awaitable[Any]],
+        fallback_model_ids: Optional[list[str]] = None,
+    ) -> Any:
+        """
+        Invoke ``fn(adapter)`` through the per-model circuit breaker,
+        falling back to ``fallback_model_ids`` in order on breaker-open
+        or model-API errors.
+
+        Args:
+            model_id:            Primary model ID. None uses the
+                                 default routed model.
+            fn:                  Callable taking an adapter and
+                                 returning an awaitable.
+            fallback_model_ids:  Optional fallback chain.
+
+        Raises:
+            NoAvailableModelError: If every model (primary + fallbacks)
+                                   is unavailable.
+        """
+        # Resolve primary model_id (auto-route when None).
+        if model_id is None:
+            with self._lock:
+                default_id = self._router._default_model_id
+            if default_id is None:
+                # Fall back to the first registered model if any.
+                with self._lock:
+                    ids = list(self._configs.keys())
+                if not ids:
+                    raise NoAvailableModelError("no models registered")
+                default_id = ids[0]
+            model_id = default_id
+
+        # Try primary.
+        cb = await self._circuit_breakers.get(model_id)
+        try:
+            return await cb.call(lambda: fn(self.get_adapter(model_id)))
+        except CircuitBreakerOpenError:
+            logger.warning(
+                "Circuit breaker open for primary '%s'", model_id
+            )
+        except (ModelAPIError, ModelTimeoutError) as e:
+            logger.warning(
+                "Primary model '%s' failed (%s), trying fallbacks",
+                model_id,
+                type(e).__name__,
+            )
+
+        # Fallback chain.
+        for fb_id in fallback_model_ids or []:
+            try:
+                adapter = self.get_adapter(fb_id)
+            except (ModelNotFoundError, ModelUnhealthyError) as e:
+                logger.warning(
+                    "Fallback model '%s' unavailable: %s", fb_id, e
+                )
+                continue
+            cb = await self._circuit_breakers.get(fb_id)
+            try:
+                return await cb.call(lambda: fn(adapter))
+            except Exception as e:
+                logger.warning(
+                    "Fallback model '%s' failed: %s", fb_id, e
+                )
+                continue
+
+        raise NoAvailableModelError(
+            f"All models exhausted (primary={model_id}, "
+            f"fallbacks={fallback_model_ids})"
+        )
+
+    def get_circuit_breaker_registry(self) -> Any:
+        """Return the per-model ``CircuitBreakerRegistry``."""
+        return self._circuit_breakers
+
+    # ------------------------------------------------------------------
+    # v0.5: Vision-capable adapter access
+    # ------------------------------------------------------------------
+
+    def get_vision_adapter(self, model_id: Optional[str] = None) -> Any:
+        """
+        Return an adapter that supports vision input.
+
+        Args:
+            model_id: Explicit model ID. If None, searches registered
+                      models for the first ``supports_vision`` one.
+
+        Raises:
+            ModelUnsupportedError: If no vision-capable model is found.
+        """
+        adapter = self.get_adapter(model_id)
+        if not getattr(adapter, "supports_vision", False):
+            raise ModelUnsupportedError(
+                f"Model '{adapter.model_id}' does not support vision input"
+            )
+        return adapter
 
     # ------------------------------------------------------------------
     # Dunder

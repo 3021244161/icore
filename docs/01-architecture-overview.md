@@ -2,7 +2,7 @@
 
 > **文档编号：** 01  
 > **项目：** icore — 企业级 LLM 工作流编排平台  
-> **版本：** 1.0  
+> **版本：** 1.1（v0.5 同步更新）  
 > **状态：** 基础设计文档（所有后续模块设计文档均以此为基础）
 
 ---
@@ -34,11 +34,15 @@ icore 覆盖以下能力域：
 | 能力域 | 说明 |
 |--------|------|
 | **任务编排** | 通过 DAG（有向无环图）调度多个 Task，支持子工作流嵌套调用 |
-| **多模型管理** | 配置多个 OpenAI 兼容模型，支持按任务类型自动路由 |
+| **多模型管理** | 配置多个 OpenAI 兼容模型，支持按任务类型自动路由；v0.5 起支持多模态视觉模型 |
 | **数据库集成** | 统一连接 Oracle、PostgreSQL、Hive、MySQL 等异构数据源 |
+| **向量数据库（v0.5）** | Milvus 适配器支持 RAG 检索增强、语义搜索、过滤表达式 |
+| **图引擎（v0.5）** | Neo4j 适配器支持知识图谱构建、Cypher 查询、GraphRAG 多跳推理 |
+| **多模态文件处理（v0.5）** | Image/Video/Audio 三类处理器，OCR、关键帧提取、ASR |
+| **工程健壮性（v0.5）** | 统一异常分级、熔断器、模型降级链、分布式锁、幂等键、乐观锁 |
 | **服务暴露** | 将工作流封装为 MCP 服务、工具服务、Streamlit 应用、SSE 接口 |
-| **统一 API** | 仅暴露两个 HTTP 接口：健康检查 + 主调用接口 |
-| **高并发处理** | 基于 asyncio 的异步执行模型，任务队列、并发控制、背压机制 |
+| **统一 API** | 仅暴露两个 HTTP 接口：健康检查（多组件探针）+ 主调用接口（含幂等键） |
+| **高并发处理** | 基于 asyncio 的异步执行模型，任务队列、并发控制、背压机制（已接入 API） |
 
 ### 1.2 典型应用场景
 
@@ -113,12 +117,20 @@ class MyTask(BaseTask):
 | **Web 框架** | FastAPI | 原生异步、自动 Swagger/OpenAPI 文档、Pydantic 原生集成 |
 | **异步运行时** | asyncio + uvicorn | 高并发 I/O 密集型场景（LLM API 调用、DB 查询均为 I/O 密集） |
 | **数据校验** | Pydantic v2 | Rust 核心、高性能、类型安全、与 FastAPI 无缝集成 |
-| **数据库驱动** | asyncpg / aiomysql / oracledb / pyhive | 原生异步驱动适配器模式（PostgreSQL / MySQL / Oracle / Hive），轻量、无 ORM 抽象层开销 |
+| **关系型数据库驱动** | asyncpg / aiomysql / oracledb / pyhive | 原生异步驱动适配器模式（PostgreSQL / MySQL / Oracle / Hive），轻量、无 ORM 抽象层开销 |
+| **向量数据库驱动（v0.5）** | pymilvus（懒导入） | Milvus 向量库，ANN 检索、过滤表达式；驱动未安装时模块仍可 import |
+| **图数据库驱动（v0.5）** | neo4j（懒导入） | Neo4j 异步 driver、Cypher 参数化查询、连接池；懒导入保证可 import |
+| **多模态处理（v0.5）** | Pillow / ffmpeg / pydub（懒导入） | 图片 OCR、视频关键帧、音频 ASR；按需安装，不强制依赖 |
 | **HTTP 客户端** | httpx | 异步、支持 HTTP/2、连接池、流式响应 |
 | **任务队列（可选）** | Redis + 自研轻量队列 | 进程内内存队列为主，Redis 作为分布式可选后端 |
+| **分布式锁（v0.5）** | Redis SET NX + Lua | token 机制防误解锁；单进程降级为 asyncio.Lock |
 | **配置管理** | Pydantic Settings | 环境变量 / YAML 双源配置、类型安全 |
 | **日志** | 标准库 `logging` | 零依赖、与 asyncio 兼容、通过 `dictConfig` 实现结构化配置 |
 | **容器化** | Docker + docker-compose | 标准化部署、环境隔离 |
+| **可观测性（v0.6）** | Prometheus + OpenTelemetry（懒导入） | 自定义指标、分布式追踪、`/metrics` 端点；详见 [docs/13](13-v0.6-implementation.md) |
+| **对象存储（v0.6）** | minio（懒导入） | S3 兼容、预签名 URL、客户端直传、分片上传 |
+| **配置热加载（v0.6）** | watchdog（懒导入、可选） | 文件监听；未安装时自动降级为 polling observer |
+| **消息队列（v0.6）** | aiokafka / aio-pika（懒导入） | Kafka / RabbitMQ 触发器、事件驱动工作流 |
 
 ### 3.1 为什么选择全异步架构
 
@@ -140,10 +152,11 @@ graph TB
     end
 
     subgraph "API 接入层"
-        HEALTH[GET /health]
-        INVOKE[POST /invoke]
+        HEALTH[GET /health<br/>多组件探针]
+        INVOKE[POST /invoke<br/>幂等键 + 背压 + 实例治理]
         SSE[SSE Stream]
         CALLBACK[Callback Manager]
+        IDEM[Idempotency Cache]
     end
 
     subgraph "工作流引擎层"
@@ -152,11 +165,13 @@ graph TB
         REGISTRY[Workflow Registry]
         QUEUE[Task Queue]
         CONCURRENCY[Concurrency Controller]
+        CB[CircuitBreaker Registry]
+        LOCK[Distributed Lock]
     end
 
     subgraph "核心抽象层"
         BASE_TASK[BaseTask ABC]
-        TASK_CTX[TaskContext]
+        TASK_CTX[TaskContext<br/>9 个 setter 注入]
         TASK_REGISTRY[Task Registry]
     end
 
@@ -164,6 +179,8 @@ graph TB
         MODEL_MGR[ModelManager]
         ROUTER[ModelRouter]
         MODEL_ADAPTER[OpenAI Adapter]
+        VISION_ADAPTER[VisionModelAdapter]
+        VALIDATORS[Output Validators]
     end
 
     subgraph "数据库连接层"
@@ -172,6 +189,26 @@ graph TB
         PG[PostgreSQL]
         ORACLE[Oracle]
         HIVE[Hive]
+        MYSQL[MySQL]
+    end
+
+    subgraph "向量库层 v0.5"
+        VS_MGR[BaseVectorStore]
+        MILVUS[Milvus Adapter]
+        INMEM_VS[InMemoryVectorStore]
+    end
+
+    subgraph "图库层 v0.5"
+        GS_MGR[BaseGraphStore]
+        NEO4J[Neo4j Adapter]
+        INMEM_GS[InMemoryGraphStore]
+    end
+
+    subgraph "多模态层 v0.5"
+        MEDIA[MediaFile]
+        IMG[ImageProcessor]
+        VID[VideoProcessor]
+        AUD[AudioProcessor]
     end
 
     subgraph "服务暴露层"
@@ -189,27 +226,50 @@ graph TB
     HEALTH --> INVOKE
     INVOKE --> REGISTRY
     INVOKE --> ENGINE
+    INVOKE --> IDEM
     SSE --> ENGINE
     CALLBACK --> HTTP
 
     ENGINE --> DAG
     ENGINE --> QUEUE
     ENGINE --> CONCURRENCY
+    ENGINE --> CB
+    ENGINE --> LOCK
     ENGINE --> BASE_TASK
     ENGINE --> TASK_CTX
 
     BASE_TASK --> MODEL_MGR
     BASE_TASK --> DB_MGR
+    BASE_TASK --> VS_MGR
+    BASE_TASK --> GS_MGR
+    BASE_TASK --> MEDIA
     TASK_CTX --> MODEL_MGR
     TASK_CTX --> DB_MGR
+    TASK_CTX --> VS_MGR
+    TASK_CTX --> GS_MGR
+    TASK_CTX --> MEDIA
+    TASK_CTX --> LOCK
+    TASK_CTX --> CB
 
     MODEL_MGR --> ROUTER
     ROUTER --> MODEL_ADAPTER
+    ROUTER --> VISION_ADAPTER
+    MODEL_MGR --> VALIDATORS
 
     DB_MGR --> POOL
     POOL --> PG
     POOL --> ORACLE
     POOL --> HIVE
+    POOL --> MYSQL
+
+    VS_MGR --> MILVUS
+    VS_MGR --> INMEM_VS
+    GS_MGR --> NEO4J
+    GS_MGR --> INMEM_GS
+
+    MEDIA --> IMG
+    MEDIA --> VID
+    MEDIA --> AUD
 
     MCP_SERVER --> REGISTRY
     TOOL_SVC --> REGISTRY
@@ -237,13 +297,17 @@ graph TB
 |------|--------|------|-----------|-------------|
 | **core** | `icore.core` | 任务抽象基类、输入输出模型、任务上下文、注册表 | `BaseTask` | 02-task-abstraction.md |
 | **engine** | `icore.engine` | 工作流引擎、DAG 调度、执行器、注册表、状态机 | `BaseWorkflow` | 04-workflow-engine.md |
-| **db** | `icore.db` | 数据库连接池、多数据源适配器、统一查询接口 | `BaseConnector` | 03-database-layer.md |
-| **models** | `icore.models` | LLM 模型适配器、多模型管理、自动路由 | `BaseModelAdapter` | 05-model-management.md |
-| **api** | `icore.api` | FastAPI 应用、请求/响应 Schema、SSE 流式、回调 | — | 06-api-layer.md |
+| **db** | `icore.db` | 数据库连接池、多数据源适配器、统一查询接口、乐观锁 | `BaseConnector` | 03-database-layer.md |
+| **models** | `icore.models` | LLM 模型适配器、多模型管理、自动路由、视觉模型、输出校验 | `BaseModelAdapter` | 05-model-management.md |
+| **vectorstore**（v0.5） | `icore.vectorstore` | 向量库抽象、Milvus 适配器、内存实现 | `BaseVectorStore` | 11-v0.5-enhancement.md §3 |
+| **graphstore**（v0.5） | `icore.graphstore` | 图库抽象、Neo4j 适配器、内存实现 | `BaseGraphStore` | 11-v0.5-enhancement.md §4 |
+| **media**（v0.5） | `icore.media` | 多模态文件抽象、Image/Video/Audio 处理器 | `BaseMediaProcessor` | 11-v0.5-enhancement.md §5 |
+| **api** | `icore.api` | FastAPI 应用、Schema、SSE、回调、幂等缓存、全局异常中间件 | — | 06-api-layer.md |
 | **services** | `icore.services` | MCP / Tool / Streamlit / SSE 服务暴露适配器 | `BaseServiceExposer` | 08-service-exposure.md |
 | **workflows** | `icore.workflows` | 具体工作流实现（示例 + 业务工作流） | — | 09-examples.md |
 | **config** | `icore.config` | 全局配置管理（环境变量 / YAML） | — | 10-directory-structure.md |
-| **concurrency** | `icore.engine` (内嵌) | 任务队列、实例管理、并发控制 | — | 07-concurrency.md |
+| **concurrency** | `icore.engine` (内嵌) | 任务队列、实例管理、并发控制、熔断器、分布式锁 | — | 07-concurrency.md |
+| **exceptions**（v0.5） | `icore.exceptions` | 统一异常分级体系（`ICoreError` 基类 + 业务/系统异常） | `ICoreError` | 11-v0.5-enhancement.md §7.1 |
 
 ### 5.2 模块依赖关系
 
@@ -256,14 +320,19 @@ services ──→ engine ──→ core
               │           │
               ├──→ models ─┘
               ├──→ db ─────┘
-              └──→ concurrency (engine 内嵌)
+              ├──→ vectorstore (v0.5)
+              ├──→ graphstore (v0.5)
+              ├──→ media (v0.5)
+              └──→ concurrency (engine 内嵌：lock / circuit_breaker / idempotency)
 ```
 
 - `core` 是最底层，不依赖任何其他 icore 模块
 - `db` 和 `models` 依赖 `core`（任务输入输出模型）
-- `engine` 依赖 `core`、`db`、`models`
+- `vectorstore` / `graphstore` / `media` 仅依赖 `icore.exceptions`，互不依赖
+- `engine` 依赖 `core`、`db`、`models`、`vectorstore`、`graphstore`、`media`（通过 TaskContext 注入）
 - `api` 和 `services` 依赖 `engine`
 - `workflows` 依赖 `core` 和 `engine`（用于实现具体业务）
+- `exceptions` 是横切关注点，被所有模块依赖
 
 ---
 
@@ -347,11 +416,13 @@ icore/
 ├── icore/                         # 主包
 │   ├── __init__.py               # 包初始化，导出版本号
 │   ├── config.py                 # 全局配置管理 (Pydantic Settings)
+│   ├── bootstrap.py              # 生产应用引导（v0.5 含 9 个 builder）
+│   ├── exceptions.py             # v0.5: 统一异常分级体系
 │   ├── core/                     # 核心抽象层
 │   │   ├── __init__.py
 │   │   ├── base_task.py          # BaseTask 抽象基类
 │   │   ├── models.py             # BaseTaskInput / BaseTaskOutput (Pydantic)
-│   │   ├── task_context.py       # TaskContext (依赖注入容器)
+│   │   ├── task_context.py       # TaskContext (依赖注入容器，v0.5 含 9 个 setter)
 │   │   └── registry.py           # TaskRegistry (任务注册表)
 │   ├── engine/                   # 工作流引擎层
 │   │   ├── __init__.py
@@ -362,30 +433,42 @@ icore/
 │   │   ├── states.py             # 状态枚举
 │   │   ├── task_queue.py         # 任务队列 (内存 / Redis)
 │   │   ├── instance_manager.py   # 任务实例管理器
-│   │   └── concurrency_control.py # 并发控制器
+│   │   ├── concurrency_control.py # 并发控制器
+│   │   ├── circuit_breaker.py    # v0.5: 熔断器（CLOSED/OPEN/HALF_OPEN）
+│   │   └── lock.py               # v0.5: 分布式锁（Redis / Memory）
 │   ├── db/                       # 数据库连接层
 │   │   ├── __init__.py
-│   │   ├── base_connector.py     # BaseConnector 抽象基类
+│   │   ├── base_connector.py     # BaseConnector 抽象基类（v0.5 含乐观锁）
 │   │   ├── connection_pool.py    # 异步连接池
 │   │   ├── manager.py            # DBManager 多数据源管理
-│   │   └── adapters/            # 数据库适配器
+│   │   └── adapters/             # 数据库适配器
 │   │       ├── __init__.py
 │   │       ├── postgresql.py     # PostgreSQL 适配器
+│   │       ├── mysql.py          # MySQL 适配器
 │   │       ├── oracle.py         # Oracle 适配器
 │   │       └── hive.py           # Hive 适配器
 │   ├── models/                   # 模型管理层
 │   │   ├── __init__.py
-│   │   ├── base_adapter.py       # BaseModelAdapter 抽象基类
+│   │   ├── base_adapter.py       # BaseModelAdapter 抽象基类（v0.5 含 supports_vision）
 │   │   ├── openai_adapter.py     # OpenAI 兼容适配器
-│   │   ├── manager.py            # ModelManager 多模型管理
+│   │   ├── vision_adapter.py     # v0.5: 多模态视觉模型适配器
+│   │   ├── manager.py            # ModelManager 多模型管理（v0.5 含熔断/降级链）
 │   │   ├── router.py             # ModelRouter 自动路由
+│   │   ├── validators.py         # v0.5: 模型输出校验（JSON / 非空）
 │   │   └── config.py             # 模型配置 Pydantic 模型
+│   ├── vectorstore/              # v0.5: 向量数据库层
+│   │   └── __init__.py           # BaseVectorStore + MilvusAdapter + InMemoryVectorStore
+│   ├── graphstore/               # v0.5: 图数据库层
+│   │   └── __init__.py           # BaseGraphStore + Neo4jAdapter + InMemoryGraphStore
+│   ├── media/                    # v0.5: 多模态文件处理层
+│   │   └── __init__.py           # MediaFile + Image/Video/AudioProcessor + Registry
 │   ├── api/                      # API 接入层
 │   │   ├── __init__.py
-│   │   ├── main.py               # FastAPI 应用 (2 个端点)
-│   │   ├── schemas.py            # 请求/响应 Pydantic 模型
+│   │   ├── main.py               # FastAPI 应用 (2 个端点，v0.5 含幂等键/异常中间件)
+│   │   ├── schemas.py            # 请求/响应 Pydantic 模型（v0.5 含 idempotency_key）
 │   │   ├── callback.py           # CallbackManager 回调管理
-│   │   └── streaming.py          # SSE 流式响应处理
+│   │   ├── streaming.py          # SSE 流式响应处理
+│   │   └── idempotency.py        # v0.5: 幂等键缓存（内存 / Redis）
 │   ├── services/                 # 服务暴露层
 │   │   ├── __init__.py
 │   │   ├── base_exposer.py       # BaseServiceExposer 抽象基类
@@ -399,7 +482,10 @@ icore/
 │           ├── __init__.py
 │           ├── document_summary.py
 │           ├── entity_extraction.py
-│           └── weekly_report.py
+│           ├── weekly_report.py
+│           ├── rag_qa.py         # v0.5: RAG 问答
+│           ├── knowledge_graph.py # v0.5: 知识图谱
+│           └── multimodal.py     # v0.5: 多模态（图片描述 / OCR 摘要）
 ├── docs/                         # 设计文档
 │   ├── 01-architecture-overview.md
 │   ├── 02-task-abstraction.md
@@ -410,8 +496,9 @@ icore/
 │   ├── 07-concurrency.md
 │   ├── 08-service-exposure.md
 │   ├── 09-examples.md
-│   └── 10-directory-structure.md
-├── tests/                        # 测试
+│   ├── 10-directory-structure.md
+│   └── 11-v0.5-enhancement.md    # v0.5: 增强设计
+├── tests/                        # 测试（521 passed + 2 skipped）
 ├── config/                       # 配置文件目录 (YAML)
 │   ├── models.yaml               # 模型配置
 │   └── databases.yaml            # 数据库配置
@@ -488,7 +575,7 @@ graph TB
 
 ### 9.1 抽象基类体系
 
-icore 的五个核心抽象基类构成系统的骨架：
+icore 的九个核心抽象基类构成系统的骨架（v0.4 五个 + v0.5 新增四个）：
 
 ```mermaid
 classDiagram
@@ -519,6 +606,7 @@ classDiagram
         +async disconnect() void
         +async execute(sql, params) result
         +async query(sql, params) rows
+        +async execute_with_version(sql, params, expected_version) int
         +async close() void
     }
 
@@ -527,6 +615,9 @@ classDiagram
         +async chat(messages) response
         +async stream_chat(messages) AsyncIterator
         +async embed(texts) vectors
+        +supports_vision: bool
+        +supports_audio: bool
+        +async chat_with_media(prompt, media_files) response
     }
 
     class BaseServiceExposer {
@@ -536,17 +627,62 @@ classDiagram
         +call_service(name, params) result
     }
 
+    class BaseVectorStore {
+        <<abstract>> v0.5
+        +async insert(collection, docs) ids
+        +async search(collection, vec, top_k) docs
+        +async delete(collection, ids) int
+        +async create_collection(name, dim) void
+        +async drop_collection(name) void
+        +async health_check() bool
+    }
+
+    class BaseGraphStore {
+        <<abstract>> v0.5
+        +async upsert_nodes(nodes) ids
+        +async upsert_edges(edges) void
+        +async query(cypher, params) rows
+        +async get_subgraph(node_ids, depth) dict
+        +async delete_nodes(ids) int
+        +async health_check() bool
+    }
+
+    class BaseMediaProcessor {
+        <<abstract>> v0.5
+        +async extract_metadata(file) dict
+        +async transcode(file, target_format) MediaFile
+        +async generate_thumbnail(file, size) MediaFile
+    }
+
+    class BaseDistributedLock {
+        <<abstract>> v0.5
+        +async acquire(key, ttl, blocking) bool
+        +async release(key) void
+        +async lock(key, ttl) AsyncContextManager
+    }
+
     BaseTask <|-- DocumentSummaryTask
     BaseTask <|-- EntityExtractionTask
     BaseWorkflow <|-- DocumentSummaryWorkflow
     BaseConnector <|-- PostgreSQLConnector
     BaseConnector <|-- OracleConnector
     BaseConnector <|-- HiveConnector
+    BaseConnector <|-- MySQLConnector
     BaseModelAdapter <|-- OpenAICompatibleAdapter
+    BaseModelAdapter <|-- VisionModelAdapter
     BaseServiceExposer <|-- MCPServiceExposer
     BaseServiceExposer <|-- StreamlitExposer
     BaseServiceExposer <|-- SSEExposer
     BaseServiceExposer <|-- ToolServiceExposer
+    BaseVectorStore <|-- MilvusAdapter
+    BaseVectorStore <|-- InMemoryVectorStore
+    BaseGraphStore <|-- Neo4jAdapter
+    BaseGraphStore <|-- InMemoryGraphStore
+    BaseMediaProcessor <|-- ImageProcessor
+    BaseMediaProcessor <|-- VideoProcessor
+    BaseMediaProcessor <|-- AudioProcessor
+    BaseDistributedLock <|-- RedisLock
+    BaseDistributedLock <|-- MemoryLock
 ```
 
 ### 9.2 注册表模式
@@ -561,7 +697,7 @@ icore 使用三个注册表管理运行时组件：
 
 `TaskContext` 是依赖注入的核心容器，在 Task 执行时由引擎创建并传入：
 
-| 字段 | 类型 | 说明 |
+| 字段 / 方法 | 类型 | 说明 |
 |------|------|------|
 | `task_id` | `str` | 任务实例 ID，用于追踪和分布式追踪 |
 | `workflow_id` | `str` | 工作流实例 ID |
@@ -570,7 +706,15 @@ icore 使用三个注册表管理运行时组件：
 | `stream` | `bool` | 是否流式返回 |
 | `metadata` | `dict` | 附加元数据 |
 | `get_model_adapter()` | 方法 | 获取模型适配器实例 |
-| `get_db(name)` | 方法 | 获取数据库连接 |
+| `get_db(name)` | 方法 | 获取数据库连接（pool-backed 句柄） |
+| `get_vectorstore()` | 方法（v0.5） | 获取 `BaseVectorStore` 实例 |
+| `get_graphstore()` | 方法（v0.5） | 获取 `BaseGraphStore` 实例 |
+| `get_media_processor()` | 方法（v0.5） | 获取 `MediaProcessorRegistry` 实例 |
+| `get_lock()` | 方法（v0.5） | 获取 `BaseDistributedLock` 实例 |
+| `get_circuit_breaker()` | 方法（v0.5） | 获取 `CircuitBreakerRegistry` 实例 |
+
+每个 v0.5 新增的 getter 都配套一个 `has_*()` 探测方法，工作流可据此判断是否需要该组件。
+所有 setter 都使用官方 `set_*` 方法（基于 `object.__setattr__`），禁止 Task 越过 setter 直接注入。
 
 Task 不直接实例化依赖，而是从 Context 获取——这使得 Task 可替换底层实现、可单元测试（mock 注入）。
 
@@ -586,16 +730,20 @@ Task 不直接实例化依赖，而是从 Context 获取——这使得 Task 可
 
 ### 10.2 可靠性要求
 
-- **任务幂等：** 相同 `task_id` 的重复调用不会产生副作用（由实例管理器去重）
+- **任务幂等：** 相同 `task_id` 的重复调用不会产生副作用（由实例管理器去重）；v0.5 起支持 `idempotency_key` 缓存 24 小时
 - **故障隔离：** 单个 Task 失败不影响其他独立工作流的执行
-- **优雅降级：** 模型 API 不可用时自动切换到 fallback 模型
+- **优雅降级：** 模型 API 不可用时自动切换到 fallback 模型（v0.5：`call_with_fallback()` 降级链）
+- **熔断保护（v0.5）：** 每个模型适配器一个 `CircuitBreaker`，连续失败达阈值即熔断，半开试探恢复
 - **超时控制：** 每个 Task 可配置超时时间，防止无限等待
+- **背压机制（v0.5）：** `ConcurrencyController.is_backpressure()` 接入 API，过载直接返回 HTTP 503
+- **分布式锁（v0.5）：** `RedisLock` / `MemoryLock` 保证并发写操作的原子性
+- **统一异常分级（v0.5）：** `ICoreError` 基类携带 `code` / `http_status` / `retryable`，全局中间件结构化返回
 
 ### 10.3 可观测性要求
 
 - **结构化日志：** 每个请求/任务携带 trace_id，贯穿全链路
 - **指标暴露：** 任务执行时长、队列深度、并发数、模型调用次数等指标
-- **健康检查：** `GET /health` 返回系统状态（数据库连通性、模型可用性、队列状态）
+- **健康检查（v0.5 增强）：** `GET /health` 并发探针 model / db / vectorstore / graphstore，聚合 `healthy` / `degraded` 状态
 
 ### 10.4 安全要求
 
@@ -621,6 +769,7 @@ Task 不直接实例化依赖，而是从 Context 获取——这使得 Task 可
 | `08-service-exposure.md` | 服务暴露 | MCP、Tool、Streamlit、SSE 适配器 | 06 |
 | `09-examples.md` | 示例工作流 | 文档摘要、实体提取、周报生成 | 02, 04 |
 | `10-directory-structure.md` | 目录结构 & README | 完整目录树、README、requirements.txt | 全部 |
+| `11-v0.5-enhancement.md`（v0.5） | v0.5 增强设计 | 向量库 / 图谱 / 多模态 / 健壮性增强方案 | 02–10 |
 
 ---
 

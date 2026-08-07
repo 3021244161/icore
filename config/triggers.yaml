@@ -1,0 +1,60 @@
+# icore triggers configuration
+# =============================================================================
+# Message-queue-driven workflow triggers (v0.6).
+#
+# Each entry under `triggers` defines one WorkflowTrigger. The `type` field
+# selects the implementation:
+#   - kafka:    subscribes to a Kafka topic (requires `aiokafka`)
+#   - rabbitmq: consumes from a RabbitMQ queue (requires `aio_pika`)
+#   - inmemory: in-process asyncio.Queue (no external broker; for dev/tests)
+#
+# When a message arrives, the trigger:
+#   1. Parses it into a dict (JSON-decoded; falls back to {"payload": <text>})
+#   2. Merges `params` underneath the message (message keys win)
+#   3. Invokes the named workflow with the merged dict
+#   4. If `result_topic` is set, publishes the workflow result back to it
+#
+# Disabled triggers (`enabled: false) are registered but not started by
+# `TriggerManager.start_all()`.
+# =============================================================================
+
+triggers:
+  # -----------------------------------------------------------------------
+  # Kafka: consume new-order events and run fraud detection.
+  # -----------------------------------------------------------------------
+  - name: fraud_detection_trigger
+    type: kafka
+    workflow: fraud_detection
+    topic: new_orders
+    group_id: icore-fraud-group
+    brokers:
+      - localhost:9092
+    result_topic: fraud_results
+    enabled: true
+    auto_commit: true
+    params:
+      threshold: 0.8
+
+  # -----------------------------------------------------------------------
+  # RabbitMQ: consume document-ingest events and run the summary workflow.
+  # -----------------------------------------------------------------------
+  - name: doc_ingest_trigger
+    type: rabbitmq
+    workflow: document_summary
+    amqp_url: "amqp://guest:guest@localhost/"
+    queue_name: doc_queue
+    exchange: ""
+    auto_commit: true
+    enabled: true
+    params:
+      max_length_per_chunk: 500
+
+  # -----------------------------------------------------------------------
+  # InMemory: local testing trigger (no broker required).
+  # -----------------------------------------------------------------------
+  - name: local_test_trigger
+    type: inmemory
+    workflow: document_summary
+    enabled: false
+    params:
+      document: "Hello icore trigger!"

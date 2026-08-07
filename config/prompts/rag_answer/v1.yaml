@@ -1,0 +1,33 @@
+version: 1
+template: |
+  你是一个专业的 RAG 问答助手。
+  请基于以下检索到的上下文回答用户问题。
+
+  上下文：
+  {context}
+
+  问题：{question}
+
+  要求：
+  1. 仅基于上下文回答，不要编造信息
+  2. 若上下文不足以回答，明确说明
+  3. 回答语言：{language}
+variables:
+  - name: context
+    type: str
+    required: true
+    description: Retrieved context passages
+  - name: question
+    type: str
+    required: true
+    description: User question
+  - name: language
+    type: str
+    default: 中文
+    required: false
+    description: Response language
+description: RAG QA prompt with retrieved context
+tags:
+  - rag
+  - qa
+  - chinese

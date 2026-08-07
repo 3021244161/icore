@@ -2,8 +2,8 @@
 
 > **文档编号：** 10  
 > **项目：** icore — 企业级 LLM 工作流编排平台  
-> **版本：** 1.0  
-> **依赖：** 01-09 全部设计文档
+> **版本：** 1.1（v0.5 同步更新）  
+> **依赖：** 01–09 全部设计文档 + 11-v0.5-enhancement.md
 
 ---
 
@@ -15,36 +15,58 @@
 4. [icore/db/ — 数据库层](#4-icoredb--数据库层)
 5. [icore/models/ — 模型管理层](#5-icoremodels--模型管理层)
 6. [icore/engine/ — 工作流引擎层](#6-icoreengine--工作流引擎层)
-7. [icore/api/ — API 层](#7-icoreapi--api-层)
-8. [icore/services/ — 服务暴露层](#8-icoreservices--服务暴露层)
-9. [icore/workflows/ — 示例工作流](#9-icoreworkflows--示例工作流)
-10. [docs/ — 设计文档](#10-docs--设计文档)
-11. [依赖关系图](#11-依赖关系图)
-12. [文件清单总览](#12-文件清单总览)
+7. [icore/vectorstore/ — 向量数据库层（v0.5）](#7-icorevectorstore--向量数据库层v05)
+8. [icore/graphstore/ — 图数据库层（v0.5）](#8-icoregraphstore--图数据库层v05)
+9. [icore/media/ — 多模态文件处理层（v0.5）](#9-icoremedia--多模态文件处理层v05)
+10. [icore/api/ — API 层](#10-icoreapi--api-层)
+11. [icore/services/ — 服务暴露层](#11-icoreservices--服务暴露层)
+12. [icore/workflows/ — 示例工作流](#12-icoreworkflows--示例工作流)
+13. [docs/ — 设计文档](#13-docs--设计文档)
+14. [依赖关系图](#14-依赖关系图)
+15. [文件清单总览](#15-文件清单总览)
 
 ---
 
 ## 1. 项目根目录
 
 ```
-mission-icore-design/
+icore-design/
 ├── .git/                          # Git 版本控制
-├── .gitignore                     # 忽略规则（__pycache__, *.pyc, .env 等）
-├── README.md                      # 项目入口文档（见 README.md）
-├── requirements.txt               # Python 依赖清单
-├── prd.json                       # 产品需求文档（10 个 User Story）
-├── progress.txt                   # 实施进度日志
-├── docs/                          # 设计文档（01-10）
+├── .gitignore                     # 忽略规则（__pycache__, *.pyc, .env, pytest_out*.txt 等）
+├── .dockerignore                  # Docker 构建忽略规则
+├── .env.example                   # 环境变量示例（v0.6 含背压/热加载/降级变量）
+├── README.md                      # 项目入口文档（v0.6 同步更新）
+├── requirements.txt               # Python 依赖清单（v0.6 含 watchdog 等可选依赖）
+├── pyproject.toml                 # 项目元数据 + pytest-asyncio 配置
+├── Dockerfile                     # 容器化构建
+├── Makefile                       # 常用命令快捷方式
+├── docs/                          # 设计文档（01-13，v0.6 新增 12/13）
+├── config/                        # YAML 配置目录（models / databases / vectorstore / graphstore / objectstore / triggers / prompts）
+├── deploy/                        # v0.6 部署产物（docker-compose + Helm + Prometheus/Grafana 配置）
 └── icore/                         # 核心 Python 包
     ├── __init__.py                 # 包入口，导出核心抽象
-    ├── config.py                   # 全局配置管理（Pydantic Settings）
+    ├── config.py                   # 全局配置管理（Pydantic Settings，v0.6 含背压/热加载/降级配置）
+    ├── bootstrap.py                # 生产应用引导（v0.6 含 12 个 builder + 治理组件接线）
+    ├── exceptions.py               # v0.5/v0.6: 统一异常分级体系
     ├── core/                       # 核心抽象层（零依赖）
     ├── db/                         # 数据库层
     ├── models/                     # 模型管理层
-    ├── engine/                     # 工作流引擎层
-    ├── api/                        # API 层
+    ├── engine/                     # 工作流引擎层（v0.6 含 agent/backoff/dlq/saga/backpressure/hot_reload/degradation）
+    ├── objectstore/                # v0.6: 对象存储层（MinIO / InMemory）
+    ├── auth/                       # v0.6: 鉴权层（API Key / JWT / RBAC）
+    ├── cache/                      # v0.6: LLM 语义缓存（L1 + L2）
+    ├── prompts/                    # v0.6: Prompt 模板管理
+    ├── retrieval/                  # v0.6: 混合检索（BM25 + RRF + Reranker）
+    ├── observability/              # v0.6: 可观测性（Prometheus + OTel）
+    ├── persistence/                # v0.6: 工作流持久化
+    ├── triggers/                   # v0.6: 消息队列触发器
+    ├── security/                   # v0.6: 安全加固（注入检测 / PII 脱敏）
+    ├── vectorstore/                # v0.5: 向量数据库层
+    ├── graphstore/                 # v0.5: 图数据库层
+    ├── media/                      # v0.5: 多模态文件处理层
+    ├── api/                        # API 层（v0.6 含鉴权依赖 + /metrics 端点）
     ├── services/                   # 服务暴露层
-    └── workflows/                  # 示例工作流
+    └── workflows/                  # 示例工作流（v0.6 新增 3 个：agent_demo / order_processing / report_export）
 ```
 
 ---
@@ -226,7 +248,9 @@ icore/engine/
 │   └── 导出: BaseWorkflow, DAG, DAGNode, DAGEdge, WorkflowExecutor,
 │            WorkflowRegistry, register_workflow, WorkflowInstanceManager,
 │            WorkflowStates, InstanceStatus, ConcurrencyController,
-│            TaskQueue, TaskPriority, WorkflowTask, rate_limit
+│            TaskQueue, TaskPriority, WorkflowTask, rate_limit,
+│            CircuitBreaker, CircuitBreakerRegistry, CircuitState,
+│            BaseDistributedLock, RedisLock, MemoryLock
 │
 ├── base_workflow.py                # BaseWorkflow ABC（~70 行）
 │   └── class BaseWorkflow(abc.ABC)
@@ -251,13 +275,14 @@ icore/engine/
 │       ├── add_node/add_edge/validate()
 │       └── get_execution_waves() -> 关键调度方法
 │
-├── executor.py                     # 工作流执行器（~160 行）
+├── executor.py                     # 工作流执行器（~280 行）
 │   └── class WorkflowExecutor
 │       ├── 无状态运行器（每次 run() 局部变量）
 │       ├── 按 DAG 波次执行：wave 内 asyncio.gather
 │       ├── 条件分支：condition=False → 目标 SKIP
 │       ├── 失败传播：BFS 标记下游 SKIP
-│       └── 子 TaskContext: "{parent_id}:{node_id}"
+│       ├── 子 TaskContext: "{parent_id}:{node_id}"
+│       └── v0.5: _create_node_context 传播 9 个组件到子节点
 │
 ├── states.py                       # 工作流状态管理（~60 行）
 │   └── enum WorkflowStates
@@ -267,23 +292,150 @@ icore/engine/
 ├── instance_manager.py             # 实例管理器（~90 行）
 │   └── class WorkflowInstanceManager
 │       ├── 创建/管理/查询工作流实例
-│       └── instance_id -> InstanceStatus 跟踪
+│       ├── instance_id -> InstanceStatus 跟踪
+│       └── cleanup_terminal_instances (TTL GC)
 │
-├── concurrency_control.py          # 并发控制器（~100 行）
+├── concurrency_control.py          # 并发控制器（~120 行）
 │   └── class ConcurrencyController
 │       ├── asyncio.Semaphore 全局并发限制
 │       ├── 工作流级并发限制（per-workflow semaphore）
+│       ├── _ConcurrencySlot (try/finally 守护，防信号量泄漏)
+│       ├── is_backpressure() -> 接入 API 返回 503
 │       └── rate_limit 装饰器
+│
+├── circuit_breaker.py              # v0.5: 熔断器（~220 行）
+│   ├── enum CircuitState: CLOSED, OPEN, HALF_OPEN
+│   ├── class CircuitBreaker
+│   │   ├── 状态机：CLOSED ↔ OPEN ↔ HALF_OPEN
+│   │   ├── failure_threshold / recovery_timeout / half_open_max_requests
+│   │   └── async call(coro_factory) -> 受保护的异步调用
+│   └── class CircuitBreakerRegistry
+│       └── 按 model_id 缓存实例，close_all() 清理
+│
+├── lock.py                         # v0.5: 分布式锁（~200 行）
+│   ├── class BaseDistributedLock(abc.ABC)
+│   │   ├── async acquire(key, ttl, blocking) -> bool
+│   │   ├── async release(key) -> None
+│   │   └── @asynccontextmanager lock(key, ttl)
+│   ├── class RedisLock
+│   │   ├── SET NX + PX 实现带 TTL 的锁
+│   │   ├── 随机 token 防误解锁（Lua 比较后 DEL）
+│   │   └── 懒导入 redis.asyncio
+│   └── class MemoryLock
+│       └── 单进程 asyncio.Lock + token 校验
 │
 └── task_queue.py                   # 任务队列（~100 行）
     ├── enum TaskPriority: LOW, NORMAL, HIGH, CRITICAL
     ├── class WorkflowTask(pydantic.BaseModel)
     └── class TaskQueue
         ├── asyncio.PriorityQueue 优先级队列
+        ├── 内存 / Redis 双后端
         └── 工作线程池消费
 ```
 
-**设计文档参考：** [04-workflow-engine.md](04-workflow-engine.md), [07-concurrency.md](07-concurrency.md)
+**设计文档参考：** [04-workflow-engine.md](04-workflow-engine.md), [07-concurrency.md](07-concurrency.md), [11-v0.5-enhancement.md](11-v0.5-enhancement.md) §7.2/§7.3
+
+---
+
+## 7. icore/vectorstore/ — 向量数据库层（v0.5）
+
+```
+icore/vectorstore/
+└── __init__.py                     # 向量库所有公共 API（~450 行）
+    ├── class VectorDocument(dataclass)
+    │   └── id, vector, metadata, text
+    ├── class BaseVectorStore(abc.ABC)
+    │   ├── async insert(collection, docs) -> list[str]
+    │   ├── async search(collection, query_vector, top_k, filter_expr) -> list[VectorDocument]
+    │   ├── async delete(collection, ids) -> int
+    │   ├── async create_collection(name, dim, index_type) -> None
+    │   ├── async drop_collection(name) -> None
+    │   ├── async health_check() -> bool
+    │   └── async close() -> None
+    ├── class MilvusAdapter(BaseVectorStore)
+    │   ├── 使用 pymilvus.MilvusClient（懒导入）
+    │   ├── 自动创建 Collection + Schema + Index
+    │   ├── 批量插入（flush + load）
+    │   ├── ANN 检索（IVF_FLAT / HNSW / IVF_PQ 可配置）
+    │   ├── 标量过滤表达式（filter_expr）
+    │   └── 连接池复用
+    └── class InMemoryVectorStore(BaseVectorStore)
+        ├── 纯 Python 实现，用于测试 / 小规模部署
+        └── 余弦相似度计算
+```
+
+**设计文档参考：** [11-v0.5-enhancement.md](11-v0.5-enhancement.md) §3
+
+---
+
+## 8. icore/graphstore/ — 图数据库层（v0.5）
+
+```
+icore/graphstore/
+└── __init__.py                     # 图库所有公共 API（~370 行）
+    ├── class GraphNode(dataclass)
+    │   └── id, labels, properties
+    ├── class GraphEdge(dataclass)
+    │   └── source_id, target_id, type, properties
+    ├── class BaseGraphStore(abc.ABC)
+    │   ├── async upsert_nodes(nodes) -> list[str]
+    │   ├── async upsert_edges(edges) -> None (idempotent on src/tgt/type)
+    │   ├── async query(cypher, params) -> list[dict]
+    │   ├── async get_subgraph(node_ids, depth) -> dict (nodes + edges)
+    │   ├── async delete_nodes(ids) -> int (cascade edges)
+    │   ├── async health_check() -> bool
+    │   └── async close() -> None
+    ├── class Neo4jAdapter(BaseGraphStore)
+    │   ├── 使用 neo4j.AsyncGraphDatabase（懒导入）
+    │   ├── 连接池（driver-level）
+    │   ├── 参数化 Cypher 防注入
+    │   └── 多数据库支持（enterprise）
+    └── class InMemoryGraphStore(BaseGraphStore)
+        ├── 纯 Python 实现，支持 Cypher 子集（MATCH / WHERE / RETURN）
+        ├── BFS 子图遍历（depth 可配置）
+        └── 边去重（同 src/tgt/type 替换）
+```
+
+**设计文档参考：** [11-v0.5-enhancement.md](11-v0.5-enhancement.md) §4
+
+---
+
+## 9. icore/media/ — 多模态文件处理层（v0.5）
+
+```
+icore/media/
+└── __init__.py                     # 多模态 API（~560 行）
+    ├── enum MediaType: IMAGE, VIDEO, AUDIO, PDF
+    ├── enum MediaSource: LOCAL, URL, BASE64, BYTES
+    ├── class MediaFile
+    │   ├── media_type, source_type, source, metadata
+    │   ├── async to_bytes() -> bytes (延迟加载)
+    │   ├── async to_base64() -> str (给多模态 API 用)
+    │   ├── property extension / mime_type (推断)
+    │   └── 支持 context manager 释放 bytes
+    ├── class BaseMediaProcessor(abc.ABC)
+    │   ├── async extract_metadata(file) -> dict
+    │   ├── async transcode(file, target_format) -> MediaFile
+    │   └── async generate_thumbnail(file, size) -> MediaFile
+    ├── class ImageProcessor(BaseMediaProcessor)
+    │   ├── Pillow 后端（懒导入）
+    │   └── async ocr(file, lang) -> str
+    ├── class VideoProcessor(BaseMediaProcessor)
+    │   ├── ffmpeg-python 后端（懒导入）
+    │   ├── async extract_keyframes(file, fps) -> list[MediaFile]
+    │   └── async extract_audio_track(file) -> MediaFile
+    ├── class AudioProcessor(BaseMediaProcessor)
+    │   ├── pydub / whisper 后端（懒导入）
+    │   ├── async transcribe(file, language) -> str
+    │   └── async split_by_silence(file, min_silence_len) -> list[MediaFile]
+    ├── class MediaProcessorRegistry
+    │   ├── register(media_type, processor)
+    │   ├── get(file) -> BaseMediaProcessor (按 media_type 路由)
+    │   └── list_types() -> list[MediaType]
+    └── create_default_media_registry() -> MediaProcessorRegistry
+```
+
+**设计文档参考：** [11-v0.5-enhancement.md](11-v0.5-enhancement.md) §5
 
 ---
 
@@ -405,17 +557,41 @@ docs/
 ├── 03-database-layer.md            # 数据库层设计
 │   └── BaseConnector、ConnectionPool、DBManager、MySQL/PG/Hive
 ├── 04-workflow-engine.md           # 工作流引擎设计
-│   └── BaseWorkflow、DAG、WorkflowExecutor、条件路由、失败传播
+│   └── BaseWorkflow、DAG、WorkflowExecutor、条件路由、失败传播、v0.6 Agent/弹性/治理组件
 ├── 05-model-management.md          # 模型管理层设计
 │   └── ModelManager、OpenAIAdapter、ModelRouter、健康检查
 ├── 06-api-layer.md                 # API 层设计（~1800 词，4 Mermaid 图）
-│   └── FastAPI 应用、同步/异步/流式三种执行模式、回调机制
+│   └── FastAPI 应用、同步/异步/流式三种执行模式、回调机制、v0.6 /metrics 端点 + 鉴权
 ├── 07-concurrency.md               # 并发与高性能设计
-│   └── 并发控制、任务队列、速率限制、批量处理
+│   └── 并发控制、任务队列、速率限制、批量处理、v0.6 全链路背压
 ├── 08-service-exposure.md          # 服务暴露层设计（~1500 词，5 Mermaid 图）
 │   └── 适配器模式、MCP/Tool/Streamlit/SSE 四种暴露方式
-└── 09-examples.md                  # 示例工作流实现（~1500 词）
-    └── 3 个真实示例：摘要、抽取、周报，含代码走读
+├── 09-examples.md                  # 示例工作流实现（~1500 词）
+│   └── 3 个真实示例：摘要、抽取、周报，含代码走读
+├── 10-directory-structure.md       # 本文档
+├── 11-v0.5-enhancement.md          # v0.5 增强设计（向量库 / 图谱 / 多模态 / 健壮性）
+├── 12-v0.6-enhancement.md          # v0.6 增强设计（方向性规划）
+└── 13-v0.6-implementation.md       # v0.6 实施总结（落地记录、验收状态、测试矩阵）
+```
+
+### 10.1 deploy/ - v0.6 部署产物
+
+```
+deploy/
+├── docker-compose.yaml             # 基础（仅 icore API）
+├── docker-compose.full.yaml        # 全家桶（icore + PG + Redis + Milvus + Neo4j + MinIO）
+├── docker-compose.obs.yaml         # 可观测性（+ Prometheus + Grafana + Jaeger + Loki）
+├── prometheus/
+│   └── prometheus.yaml              # Prometheus 抓取配置
+├── grafana/
+│   └── provisioning/
+│       └── datasources/
+│           └── datasources.yaml     # Grafana 数据源（Prometheus + Loki + Jaeger）
+└── helm/                            # Kubernetes Helm Chart
+    ├── Chart.yaml                   # chart 元数据 + 依赖
+    ├── values.yaml                  # 默认值（镜像、资源、自动伸缩、依赖开关）
+    └── templates/
+        └── _helpers.tpl             # 模板辅助函数（labels / selectors）
 ```
 
 ---

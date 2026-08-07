@@ -448,6 +448,30 @@ Content-Type: application/json
 - **客户端可重试：** 503 + Retry-After 是标准 HTTP 语义，客户端 SDK 可自动重试
 - **保护已有任务：** 拒绝新请求保证正在执行的任务有足够资源完成
 
+### 7.4 v0.6 全链路背压扩展
+
+v0.5 的 `ConcurrencyController` 只覆盖**任务级**背压（全局/工作流并发 + 队列深度）。v0.6 通过 `BackpressureCoordinator`（[icore/engine/backpressure.py](../icore/engine/backpressure.py)）把背压扩展到**每个外部依赖**，避免单一嘈杂组件拖垮整个系统：
+
+| 组件 | 背压维度 | 配置项 |
+|------|----------|--------|
+| LLM API | 按 model_id 的并发 + token bucket 限流 | `ICORE_BACKPRESSURE_LLM_MAX_CONCURRENT` |
+| Milvus | `search()` / `insert()` 的 asyncio.Semaphore | `ICORE_BACKPRESSURE_VECTOR_MAX_CONCURRENT` |
+| Neo4j | 查询并发上限 | `ICORE_BACKPRESSURE_GRAPH_MAX_CONCURRENT` |
+| PostgreSQL | 连接池饱和度（已有信号） | `ICORE_BACKPRESSURE_DB_MAX_CONCURRENT` |
+| 内存预算 | 进程 RSS 软上限，超限触发 503 | `ICORE_BACKPRESSURE_MEMORY_BUDGET_MB` |
+
+**接线方式**（详见 [AGENTS.md §4.6](../AGENTS.md)）：
+
+- `bootstrap.create_production_app()` 调 `build_backpressure_coordinator()` 构建并注入
+- `/health` 端点把 `BackpressureSnapshot.to_dict()` 一并暴露，任一组件饱和则 `status: degraded`
+- `/invoke` 在 `BackpressureCoordinator.is_saturated()` 返回 True 时返回 503
+
+**设计要点：**
+
+- 每个依赖独占自己的 `asyncio.Semaphore`，互不饿死
+- 协调器**不主动抛异常**，只报告 `is_saturated(name)`；调用方决定 fail fast（API 503）或 queue（executor）
+- `BackpressureSnapshot` 是 typed snapshot，`/health` 直接消费，可观测性是一等公民
+
 ---
 
 ## 8. 速率限制

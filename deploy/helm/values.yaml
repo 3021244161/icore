@@ -1,0 +1,199 @@
+# icore Helm chart — default values.
+#
+# Install:
+#   helm install icore deploy/helm
+#
+# Override per-environment:
+#   helm install icore deploy/helm -f deploy/helm/values-prod.yaml
+#   helm install icore deploy/helm --set image.tag=v1.0.0
+
+# ---- icore API image ----
+image:
+  repository: icore
+  tag: latest
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+# ---- Deployment / ReplicaSet ----
+replicaCount: 2
+
+# ---- Service ----
+service:
+  type: ClusterIP
+  port: 8000
+  targetPort: 8000
+  annotations: {}
+
+# ---- icore runtime config (env vars) ----
+icore:
+  # 12-Factor: most config is via env vars; YAML files are mounted
+  # from a ConfigMap (see configMaps below).
+  debug: false
+  logLevel: INFO
+  api:
+    host: 0.0.0.0
+    port: 8000
+    workers: 1
+  concurrency:
+    maxConcurrentTasks: 100
+    maxConcurrentPerWorkflow: 20
+    taskQueueBackend: redis
+    taskTimeout: 600
+    backpressureThreshold: 500
+    # When taskQueueBackend=redis, set redisUrl to the Redis service.
+    redisUrl: redis://icore-redis-master:6379/0
+  backpressure:
+    enabled: true
+    memoryBudgetMb: 2048
+    checkInterval: 5.0
+    llmMaxConcurrent: 20
+    vectorMaxConcurrent: 20
+    graphMaxConcurrent: 20
+    dbMaxConcurrent: 20
+  hotReload:
+    enabled: true
+    useWatchdog: true
+    pollInterval: 1.0
+  degradation:
+    enabled: true
+    failureThreshold: 3
+    recoveryInterval: 30.0
+  # YAML config files mounted at /app/config.
+  configDir: /app/config
+  # Modules auto-imported at startup.
+  workflowModules:
+    - icore.workflows.examples
+  autoregisterWorkflows: true
+
+# ---- Secrets ----
+# Reference existing secrets; do NOT inline secret values here.
+existingSecret: ""
+secrets:
+  openaiApiKey: ""
+  dbUser: icore
+  dbPassword: icore
+
+# ---- Resources ----
+resources:
+  limits:
+    cpu: 1000m
+    memory: 2Gi
+  requests:
+    cpu: 200m
+    memory: 512Mi
+
+# ---- HorizontalPodAutoscaler ----
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 8
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+
+# ---- Probe tuning ----
+probes:
+  liveness:
+    httpGet:
+      path: /health
+      port: http
+    initialDelaySeconds: 30
+    periodSeconds: 30
+    timeoutSeconds: 5
+    failureThreshold: 3
+  readiness:
+    httpGet:
+      path: /health
+      port: http
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+
+# ---- Service account / RBAC ----
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+# ---- Ingress ----
+ingress:
+  enabled: false
+  className: nginx
+  annotations: {}
+  hosts:
+    - host: icore.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+# ---- ConfigMap with config/*.yaml ----
+configMaps:
+  # When true, the chart mounts every file under deploy/helm/config/
+  # as a ConfigMap volume at /app/config.
+  enabled: true
+  # Inline YAML configs (override per-environment). These take
+  # precedence over the files in deploy/helm/config/.
+  modelsYaml: ""
+  databasesYaml: ""
+  objectstoreYaml: ""
+  vectorstoreYaml: ""
+  graphstoreYaml: ""
+  triggersYaml: ""
+
+# ---- Infrastructure dependencies ----
+# Disable any to skip that piece of the stack (e.g. when an external
+# managed instance is used instead).
+postgresql:
+  enabled: true
+  auth:
+    username: icore
+    password: icore
+    database: icore
+    postgresPassword: icore
+  primary:
+    persistence:
+      size: 10Gi
+
+redis:
+  enabled: true
+  auth:
+    enabled: false
+  master:
+    persistence:
+      size: 5Gi
+
+minio:
+  enabled: true
+  mode: standalone
+  auth:
+    rootUser: minioadmin
+    rootPassword: minioadmin
+  persistence:
+    size: 20Gi
+
+# Milvus and Neo4j are not Bitnami charts; users typically install
+# them via upstream charts. The chart includes service references so
+# icore can connect to externally-provisioned instances.
+milvus:
+  enabled: false
+  # When enabled, install milvus via:
+  #   helm repo add milvus https://zilliztech.github.io/milvus-helm/
+  #   helm install milvus milvus/milvus
+  external:
+    host: milvus.milvus.svc.cluster.local
+    port: 19530
+
+neo4j:
+  enabled: false
+  external:
+    uri: bolt://neo4j.neo4j.svc.cluster.local:7687
+    username: neo4j
+    password: neo4jpassword
+
+# ---- Observability ----
+observability:
+  # Prometheus /metrics scrape annotation. Set to false to opt out.
+  prometheusScrape: true
+  prometheusPort: 8000
+  prometheusPath: /metrics

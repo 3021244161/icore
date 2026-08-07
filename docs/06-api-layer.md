@@ -62,8 +62,11 @@ icore 通过**高度抽象**将所有工作流调用收敛到一个主接口：
 
 | 端点 | 方法 | 参数 | 用途 |
 |------|------|------|------|
-| `/health` | GET | 无 | 系统健康检查 |
-| `/invoke` | POST | InvokeRequest (JSON body) | 工作流调用主接口 |
+| `/health` | GET | 无 | 系统健康检查（免鉴权） |
+| `/invoke` | POST | InvokeRequest (JSON body) | 工作流调用主接口（v0.6 起可挂鉴权依赖） |
+| `/metrics` | GET | 无 | Prometheus 指标导出（v0.6 新增，免鉴权，只读） |
+
+> **v0.6 说明：** `/metrics` 是可观测性端点，只读、免鉴权，**不算业务端点**，与"恰好两个核心业务端点"的设计哲学不冲突。`/invoke` 在 `ICORE_AUTH_ENABLED=true` 时走 FastAPI Dependency（API Key 或 JWT），`/health` 与 `/metrics` 始终免鉴权。详见 [docs/13-v0.6-implementation.md](13-v0.6-implementation.md)。
 
 ### 2.2 端点职责
 

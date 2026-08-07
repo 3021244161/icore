@@ -8,13 +8,29 @@
 # Reference: docs/05-model-management.md
 # =============================================================================
 
-default_model_id: "gpt-4o-mini"          # Default model when none specified
+default_model_id: "doubao-seed-2.0-lite"          # Default model when none specified
 enable_auto_routing: true                 # Enable automatic model routing
 
 # -----------------------------------------------------------------------------
 # Registered Models
 # -----------------------------------------------------------------------------
 models:
+
+  # --- Test model: doubao-seed-2.0-lite via Volcengine Ark ---
+  doubao-seed-2.0-lite:
+    model_name: "doubao-seed-2.0-lite"
+    api_base: "https://ark.cn-beijing.volces.com/api/coding/v3"
+    api_key: "${ARK_API_KEY}"
+    model_type: "vision"
+    max_tokens: 8192
+    temperature: 0.7
+    request_timeout: 120
+    max_retries: 3
+    retry_delay: 1.0
+    cost_per_1k_input: 0.0
+    cost_per_1k_output: 0.0
+    enabled: true
+    tags: ["capable", "cheap"]
 
   # --- Example: GPT-4o (high-capability, high-cost) ---
   gpt-4o:

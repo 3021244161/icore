@@ -81,6 +81,8 @@ class DAGNode(BaseModel):
         retries:        Number of retry attempts on failure (default 0).
         timeout:        Optional per-node timeout in seconds.
         metadata:       Free-form metadata for extensibility.
+        is_agent:       Whether this node is an Agent node (v0.6).
+        agent_config:   AgentConfig instance when is_agent=True (v0.6).
     """
 
     model_config = ConfigDict(
@@ -114,6 +116,18 @@ class DAGNode(BaseModel):
     metadata: dict[str, Any] = Field(
         default_factory=dict,
         description="Free-form node metadata",
+    )
+    # v0.6: Agent 节点显式字段（AGENTS.md §10.11）。
+    # is_agent / agent_config 必须作为直接关键字参数传递，不能塞进 metadata dict。
+    # agent_config 实际类型为 AgentConfig | None，用 Any 避免 import 循环
+    # （icore.engine.agent 依赖 icore.engine.dag，反向 import 会循环）。
+    is_agent: bool = Field(
+        default=False,
+        description="Whether this node is an Agent node (v0.6)",
+    )
+    agent_config: Any = Field(
+        default=None,
+        description="AgentConfig instance when is_agent=True (v0.6)",
     )
 
     def model_post_init(self, __context: Any) -> None:
@@ -212,6 +226,8 @@ class DAG:
         model_id: str | None = None,
         retries: int = 0,
         timeout: float | None = None,
+        is_agent: bool = False,
+        agent_config: Any = None,
         **metadata: Any,
     ) -> DAGNode:
         """
@@ -230,6 +246,8 @@ class DAG:
             model_id:       Optional model override for this node.
             retries:        Retry attempts on failure.
             timeout:        Per-node timeout in seconds.
+            is_agent:       Whether this node is an Agent node (v0.6).
+            agent_config:   AgentConfig instance when is_agent=True (v0.6).
             **metadata:     Additional metadata stored on the node.
 
         Returns:
@@ -241,6 +259,23 @@ class DAG:
         if node_id in self._nodes:
             raise ValueError(f"Node '{node_id}' already exists in the DAG")
 
+        # Backward compat: extract is_agent / agent_config from the metadata
+        # dict if the caller passed them via metadata={"is_agent": True, ...}
+        # instead of as explicit keyword arguments (AGENTS.md §10.11).
+        # Explicit keyword arguments take precedence.
+        if "is_agent" in metadata and not is_agent:
+            is_agent = bool(metadata["is_agent"])
+        if "agent_config" in metadata and agent_config is None:
+            agent_config = metadata["agent_config"]
+
+        # Mirror is_agent / agent_config into the metadata dict so that
+        # existing code reading node.metadata["is_agent"] still works
+        # (AGENTS.md §10.11 backward compatibility).
+        if is_agent:
+            metadata["is_agent"] = is_agent
+        if agent_config is not None:
+            metadata["agent_config"] = agent_config
+
         node = DAGNode(
             node_id=node_id,
             task_name=task_name,
@@ -250,6 +285,8 @@ class DAG:
             model_id=model_id,
             retries=retries,
             timeout=timeout,
+            is_agent=is_agent,
+            agent_config=agent_config,
             metadata=metadata,
         )
         self._nodes[node_id] = node

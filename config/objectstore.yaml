@@ -1,0 +1,19 @@
+# icore objectstore configuration
+# =============================================================================
+# Backend: "minio" or "memory" (default: "memory")
+#   - "memory": InMemoryObjectStore (no external deps, for dev/demo/tests)
+#   - "minio":  MinIOAdapter        (requires minio SDK + MinIO/S3 server)
+# =============================================================================
+
+backend: memory
+
+# ---------------------------------------------------------------------------
+# MinIO settings (used only when backend == "minio")
+# ---------------------------------------------------------------------------
+minio:
+  endpoint: ${MINIO_ENDPOINT}
+  access_key: ${MINIO_ACCESS_KEY}
+  secret_key: ${MINIO_SECRET_KEY}
+  secure: false
+  region: us-east-1
+  default_bucket: icore

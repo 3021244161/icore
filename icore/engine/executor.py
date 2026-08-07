@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -40,6 +41,7 @@ from icore.core.models import BaseTaskInput, BaseTaskOutput
 from icore.core.task_context import TaskContext
 from icore.engine.dag import DAG, DAGNode
 from icore.engine.states import TaskState, WorkflowState
+from icore.observability import get_metrics_registry, start_span
 
 if TYPE_CHECKING:
     from icore.core.registry import TaskRegistry
@@ -168,6 +170,10 @@ class WorkflowExecutor:
         self,
         task_registry: TaskRegistry | None = None,
         workflow_registry: WorkflowRegistry | None = None,
+        *,
+        persistence_manager: Any = None,
+        dlq: Any = None,
+        task_queue: Any = None,
     ) -> None:
         """
         Initialize the executor.
@@ -177,6 +183,16 @@ class WorkflowExecutor:
                                the global default TaskRegistry is used.
             workflow_registry: Optional WorkflowRegistry instance. If None,
                                the global default WorkflowRegistry is used.
+            persistence_manager: Optional WorkflowPersistenceManager (v0.6).
+                               When wired AND ``run(..., execution_id=...)``
+                               is passed, each node's result is recorded
+                               and a checkpoint is saved after every wave.
+            dlq:               Optional DeadLetterQueue (v0.6). When wired,
+                               nodes that exhaust all retries are enqueued
+                               for later replay.
+            task_queue:        Optional TaskQueue (v0.6 可观测性). When wired,
+                               its depth is exported via the
+                               ``icore_queue_depth`` gauge at run() start.
         """
         if task_registry is not None:
             self._task_registry = task_registry
@@ -194,6 +210,12 @@ class WorkflowExecutor:
 
             self._workflow_registry = _default_wr
 
+        # v0.6 optional wirings (default None -> no-op, preserves the
+        # infrastructure-free test path).
+        self._persistence = persistence_manager
+        self._dlq = dlq
+        self._task_queue = task_queue
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -203,6 +225,10 @@ class WorkflowExecutor:
         dag: DAG,
         ctx: TaskContext,
         params: dict[str, Any],
+        *,
+        execution_id: str | None = None,
+        workflow_name: str = "",
+        checkpoint: dict[str, Any] | None = None,
     ) -> BaseTaskOutput:
         """
         Execute a workflow DAG and return the aggregated result.
@@ -213,6 +239,15 @@ class WorkflowExecutor:
             dag:    The validated task dependency graph.
             ctx:    Parent TaskContext (has model_manager, db_manager injected).
             params: Workflow input parameters (dict from API request).
+            execution_id: Optional v0.6 persistence execution ID. When
+                    provided AND ``self._persistence`` is wired, each
+                    node's result is recorded and a checkpoint is saved
+                    after every wave (enables断点续跑).
+            workflow_name: Optional workflow name for DLQ metadata.
+            checkpoint: Optional resume checkpoint (v0.6). When provided,
+                    nodes listed in ``checkpoint["completed_nodes"]`` are
+                    skipped and their state is marked COMPLETED, enabling
+                    断点续跑 from a previously failed/paused execution.
 
         Returns:
             BaseTaskOutput with the aggregated result from terminal nodes.
@@ -228,95 +263,153 @@ class WorkflowExecutor:
         result = WorkflowExecutionResult()
         result.workflow_state = WorkflowState.RUNNING
 
+        # 3a. Resume from checkpoint: pre-populate skipped_nodes and
+        #     node_states so the wave scheduler skips completed nodes.
+        if checkpoint:
+            completed = checkpoint.get("completed_nodes", [])
+            result.skipped_nodes.update(completed)
+            for nid in completed:
+                result.node_states[nid] = TaskState.COMPLETED
+            logger.info(
+                "Resuming from checkpoint: %d completed node(s) skipped",
+                len(completed),
+            )
+
         # 4. Get execution waves for parallel scheduling
         waves = dag.get_execution_waves()
 
-        # 5. Execute wave by wave
-        for wave in waves:
-            # Filter out skipped nodes
-            executable = [
-                nid for nid in wave if nid not in result.skipped_nodes
-            ]
+        # 可观测性：活跃实例数 +1（结束时在 finally 中 -1）
+        try:
+            get_metrics_registry().get_gauge(
+                "icore_active_instances"
+            ).inc()
+        except Exception:  # noqa: BLE001 — metrics 不得影响核心逻辑
+            pass
+        # 可观测性：如有 task_queue，导出队列深度
+        if self._task_queue is not None:
+            try:
+                _qsize = await self._task_queue.size()
+                get_metrics_registry().get_gauge(
+                    "icore_queue_depth"
+                ).set(_qsize, queue_name="default")
+            except Exception:  # noqa: BLE001
+                pass
 
-            if not executable:
-                continue
+        try:
+            with start_span(
+                "workflow.execute", workflow_name=workflow_name
+            ):
+                # 5. Execute wave by wave
+                for wave in waves:
+                    # Filter out skipped nodes
+                    executable = [
+                        nid for nid in wave if nid not in result.skipped_nodes
+                    ]
 
-            # Check conditional edges for each node in this wave
-            to_execute: list[str] = []
-            for node_id in executable:
-                if self._should_skip_node(dag, node_id, result):
-                    result.skipped_nodes.add(node_id)
-                    result.node_states[node_id] = TaskState.SKIPPED
-                    logger.debug(
-                        "Node '%s' skipped (conditional or failed upstream)",
-                        node_id,
-                    )
-                else:
-                    to_execute.append(node_id)
+                    if not executable:
+                        continue
 
-            if not to_execute:
-                continue
+                    # Check conditional edges for each node in this wave
+                    to_execute: list[str] = []
+                    for node_id in executable:
+                        if self._should_skip_node(dag, node_id, result):
+                            result.skipped_nodes.add(node_id)
+                            result.node_states[node_id] = TaskState.SKIPPED
+                            logger.debug(
+                                "Node '%s' skipped (conditional or failed upstream)",
+                                node_id,
+                            )
+                        else:
+                            to_execute.append(node_id)
 
-            # Execute all nodes in this wave concurrently
-            tasks = [
-                self._execute_node(
-                    dag.get_node(nid),
-                    dag,
-                    ctx,
-                    params,
-                    result,
-                    model_manager,
-                    db_manager,
+                    if not to_execute:
+                        continue
+
+                    # Execute all nodes in this wave concurrently
+                    tasks = [
+                        self._execute_node(
+                            dag.get_node(nid),
+                            dag,
+                            ctx,
+                            params,
+                            result,
+                            model_manager,
+                            db_manager,
+                        )
+                        for nid in to_execute
+                    ]
+                    outputs = await asyncio.gather(*tasks, return_exceptions=True)
+
+                    # Process results
+                    for node_id, output in zip(to_execute, outputs):
+                        if isinstance(output, Exception):
+                            logger.error(
+                                "Node '%s' raised exception: %s", node_id, output
+                            )
+                            result.node_outputs[node_id] = BaseTaskOutput.failure(
+                                str(output)
+                            )
+                            result.node_states[node_id] = TaskState.FAILED
+                        else:
+                            result.node_outputs[node_id] = output
+                            result.node_states[node_id] = (
+                                TaskState.COMPLETED
+                                if output.is_success
+                                else TaskState.FAILED
+                            )
+
+                        # v0.6: record per-node execution + enqueue failed nodes.
+                        node_state = result.node_states[node_id]
+                        node_obj = dag.get_node(node_id)
+                        task_name = getattr(node_obj, "task_name", "") or ""
+                        await self._record_node(
+                            execution_id=execution_id,
+                            node_id=node_id,
+                            task_name=task_name,
+                            state=node_state,
+                            output=result.node_outputs.get(node_id),
+                            workflow_name=workflow_name,
+                            ctx=ctx,
+                        )
+
+                        # If a node failed, mark all downstream nodes as skipped
+                        if result.node_states[node_id] == TaskState.FAILED:
+                            self._mark_downstream_skipped(
+                                dag, node_id, result.skipped_nodes
+                            )
+
+                    # v0.6: save checkpoint after each wave (enables resume).
+                    await self._save_checkpoint(execution_id, result)
+
+                # 6. Determine final workflow state
+                any_failed = any(
+                    s == TaskState.FAILED for s in result.node_states.values()
                 )
-                for nid in to_execute
-            ]
-            outputs = await asyncio.gather(*tasks, return_exceptions=True)
-
-            # Process results
-            for node_id, output in zip(to_execute, outputs):
-                if isinstance(output, Exception):
-                    logger.error(
-                        "Node '%s' raised exception: %s", node_id, output
+                if any_failed:
+                    result.workflow_state = WorkflowState.FAILED
+                    failed_nodes = [
+                        nid
+                        for nid, s in result.node_states.items()
+                        if s == TaskState.FAILED
+                    ]
+                    result.error = (
+                        f"Workflow failed: nodes {failed_nodes} did not complete"
                     )
-                    result.node_outputs[node_id] = BaseTaskOutput.failure(
-                        str(output)
-                    )
-                    result.node_states[node_id] = TaskState.FAILED
+                    logger.warning("Workflow failed: %s", failed_nodes)
                 else:
-                    result.node_outputs[node_id] = output
-                    result.node_states[node_id] = (
-                        TaskState.COMPLETED
-                        if output.is_success
-                        else TaskState.FAILED
-                    )
+                    result.workflow_state = WorkflowState.COMPLETED
+                    logger.info("Workflow completed successfully")
 
-                # If a node failed, mark all downstream nodes as skipped
-                if result.node_states[node_id] == TaskState.FAILED:
-                    self._mark_downstream_skipped(
-                        dag, node_id, result.skipped_nodes
-                    )
-
-        # 6. Determine final workflow state
-        any_failed = any(
-            s == TaskState.FAILED for s in result.node_states.values()
-        )
-        if any_failed:
-            result.workflow_state = WorkflowState.FAILED
-            failed_nodes = [
-                nid
-                for nid, s in result.node_states.items()
-                if s == TaskState.FAILED
-            ]
-            result.error = (
-                f"Workflow failed: nodes {failed_nodes} did not complete"
-            )
-            logger.warning("Workflow failed: %s", failed_nodes)
-        else:
-            result.workflow_state = WorkflowState.COMPLETED
-            logger.info("Workflow completed successfully")
-
-        # 7. Return terminal output
-        return result.get_terminal_output(dag.get_terminal_nodes())
+                # 7. Return terminal output
+                return result.get_terminal_output(dag.get_terminal_nodes())
+        finally:
+            # 可观测性：活跃实例数 -1
+            try:
+                get_metrics_registry().get_gauge(
+                    "icore_active_instances"
+                ).dec()
+            except Exception:  # noqa: BLE001
+                pass
 
     # ------------------------------------------------------------------
     # Node execution
@@ -361,17 +454,37 @@ class WorkflowExecutor:
             dag, node.node_id, result
         )
 
-        # Route to sub-workflow or task execution
-        if node.is_subworkflow:
-            return await self._execute_subworkflow(
-                node, parent_ctx, params, upstream_outputs,
-                model_manager, db_manager,
-            )
+        # 可观测性：节点级 tracer span + 执行耗时 histogram
+        _node_start = time.monotonic()
+        _task_name = getattr(node, "task_name", "") or ""
+        _model_id = getattr(node, "model_id", "") or ""
+        try:
+            with start_span(
+                f"node.{node.node_id}",
+                node_id=node.node_id,
+                task_name=_task_name,
+                model_id=_model_id,
+            ):
+                # Route to sub-workflow or task execution
+                if node.is_subworkflow:
+                    return await self._execute_subworkflow(
+                        node, parent_ctx, params, upstream_outputs,
+                        model_manager, db_manager,
+                    )
 
-        return await self._execute_task(
-            node, parent_ctx, params, upstream_outputs,
-            result, model_manager, db_manager,
-        )
+                return await self._execute_task(
+                    node, parent_ctx, params, upstream_outputs,
+                    result, model_manager, db_manager,
+                )
+        finally:
+            # 可观测性：记录节点执行耗时（task_name 作为标签）
+            try:
+                _duration = time.monotonic() - _node_start
+                get_metrics_registry().get_histogram(
+                    "icore_task_duration_seconds"
+                ).observe(_duration, task_name=_task_name)
+            except Exception:  # noqa: BLE001 — metrics 不得影响核心逻辑
+                pass
 
     async def _execute_task(
         self,
@@ -646,6 +759,10 @@ class WorkflowExecutor:
         and metadata from the parent, but gets:
             - A unique task_id (parent_task_id:node_id)
             - model_id from node config (or parent's)
+
+        v0.5: Also propagates vectorstore / graphstore / media_processor /
+        lock / circuit_breaker from the parent context so that tasks
+        using these new components can access them.
         """
         child_task_id = f"{parent_ctx.task_id}:{node.node_id}"
 
@@ -664,7 +781,132 @@ class WorkflowExecutor:
         if db_manager is not None:
             child_ctx.set_db_manager(db_manager)
 
+        # v0.5: Propagate new injectable components from parent context.
+        if parent_ctx.has_vectorstore():
+            child_ctx.set_vectorstore(parent_ctx.get_vectorstore())
+        if parent_ctx.has_graphstore():
+            child_ctx.set_graphstore(parent_ctx.get_graphstore())
+        if parent_ctx.has_media_processor():
+            child_ctx.set_media_processor(parent_ctx.get_media_processor())
+        if parent_ctx.has_lock():
+            child_ctx.set_lock(parent_ctx.get_lock())
+        if parent_ctx.has_circuit_breaker():
+            child_ctx.set_circuit_breaker(parent_ctx.get_circuit_breaker())
+        # v0.6: Propagate objectstore so multi-node workflows (e.g.
+        # report_export's upload_to_store node) can access it.
+        if parent_ctx.has_objectstore():
+            child_ctx.set_objectstore(parent_ctx.get_objectstore())
+
         return child_ctx
+
+    # ------------------------------------------------------------------
+    # v0.6 persistence + DLQ helpers (no-op when not wired)
+    # ------------------------------------------------------------------
+
+    async def _record_node(
+        self,
+        *,
+        execution_id: str | None,
+        node_id: str,
+        task_name: str,
+        state: TaskState,
+        output: BaseTaskOutput | None,
+        workflow_name: str,
+        ctx: TaskContext,
+    ) -> None:
+        """Record a node's execution to persistence + enqueue on failure.
+
+        Both persistence and DLQ are optional wirings; when not wired this
+        method is a no-op, preserving the infrastructure-free test path.
+        """
+        # Map executor TaskState -> persistence ExecutionStatus string.
+        status_map = {
+            TaskState.COMPLETED: "completed",
+            TaskState.FAILED: "failed",
+            TaskState.SKIPPED: "skipped",
+            TaskState.CANCELLED: "cancelled",
+            TaskState.RUNNING: "running",
+            TaskState.PENDING: "pending",
+        }
+        status = status_map.get(state, "unknown")
+
+        # 1. Record to persistence backend.
+        if self._persistence is not None and execution_id:
+            try:
+                output_data = (
+                    output.data if output is not None else None
+                )
+                error_msg = (
+                    output.error
+                    if output is not None and not output.is_success
+                    else None
+                )
+                await self._persistence.record_task_execution(
+                    execution_id=execution_id,
+                    node_id=node_id,
+                    task_name=task_name,
+                    status=status,
+                    output=output_data,
+                    error=error_msg,
+                )
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning(
+                    "persistence record_task_execution failed for "
+                    "node '%s': %s",
+                    node_id,
+                    e,
+                )
+
+        # 2. Enqueue to DLQ when the node ultimately failed.
+        if (
+            self._dlq is not None
+            and state == TaskState.FAILED
+            and output is not None
+            and not output.is_success
+        ):
+            try:
+                await self._dlq.enqueue(
+                    workflow_name=workflow_name or ctx.workflow_id,
+                    task_id=ctx.task_id,
+                    node_id=node_id,
+                    task_name=task_name,
+                    params=None,
+                    error=output.error or "unknown error",
+                    metadata={"execution_id": execution_id},
+                )
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning(
+                    "DLQ enqueue failed for node '%s': %s", node_id, e
+                )
+
+    async def _save_checkpoint(
+        self,
+        execution_id: str | None,
+        result: WorkflowExecutionResult,
+    ) -> None:
+        """Save a checkpoint after each wave (enables resume)."""
+        if self._persistence is None or not execution_id:
+            return
+        try:
+            checkpoint = {
+                "completed_nodes": [
+                    nid
+                    for nid, s in result.node_states.items()
+                    if s == TaskState.COMPLETED
+                ],
+                "failed_nodes": [
+                    nid
+                    for nid, s in result.node_states.items()
+                    if s == TaskState.FAILED
+                ],
+                "skipped_nodes": sorted(result.skipped_nodes),
+                "workflow_state": result.workflow_state.value
+                if hasattr(result.workflow_state, "value")
+                else str(result.workflow_state),
+            }
+            await self._persistence.save_checkpoint(execution_id, checkpoint)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("save_checkpoint failed: %s", e)
 
     # ------------------------------------------------------------------
     # Conditional branching & skip propagation

@@ -1,0 +1,23 @@
+version: 2
+template: |
+  You are an expert summarizer. Summarize the following document
+  in a structured format with 3 bullet points.
+
+  Document: {document}
+
+  Maximum words per bullet: {max_words}
+variables:
+  - name: max_words
+    type: int
+    default: 100
+    required: false
+    description: Maximum words per bullet
+  - name: document
+    type: str
+    required: true
+    description: Document text to summarize
+description: Summarize a document into 3 structured bullet points (English)
+tags:
+  - summarization
+  - structured
+  - english

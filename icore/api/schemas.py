@@ -47,6 +47,8 @@ class InvokeRequest(BaseModel):
         stream:         If True, results are streamed via SSE. If False,
                        the API waits for completion and returns JSON.
         metadata:       Free-form metadata (trace_id, user_id, etc.).
+        resume_from:    断点续跑的 execution_id（v0.6）。传入后从 checkpoint
+                       恢复执行，跳过已完成节点。需要 persistence 已接线。
     """
 
     model_config = ConfigDict(
@@ -88,6 +90,24 @@ class InvokeRequest(BaseModel):
     metadata: dict[str, Any] = Field(
         default_factory=dict,
         description="Free-form metadata (trace_id, user_id, etc.)",
+    )
+    idempotency_key: Optional[str] = Field(
+        default=None,
+        description=(
+            "Idempotency key. Repeated requests with the same key "
+            "return the original result without re-executing the "
+            "workflow. Keys are cached for 24 hours."
+        ),
+        examples=["idem-9f3c-4a1e-8b2d-1f0e2a3b4c5d"],
+    )
+    resume_from: Optional[str] = Field(
+        default=None,
+        description=(
+            "断点续跑：传入一个已存在（FAILED 或 PAUSED）的 execution_id，"
+            "API 会从其 checkpoint 恢复执行。需要 persistence 已接线，"
+            "否则返回 422。"
+        ),
+        examples=["exec-550e8400-e29b-41d4-a716-446655440000"],
     )
 
 
@@ -139,10 +159,19 @@ class HealthResponse(BaseModel):
     A simple health check endpoint that returns system status and
     version information. No authentication required.
 
+    v0.5 enhancement: When infrastructure components are wired, the
+    response also includes a ``components`` dict with per-component
+    health status. The overall ``status`` is ``"healthy"`` only when
+    all required components are healthy; otherwise it is ``"degraded"``.
+
     Attributes:
-        status:    System health status: "healthy" or "unhealthy".
-        version:   icore version string.
-        timestamp: ISO 8601 timestamp of the health check.
+        status:     System health status: "healthy" or "degraded".
+        version:    icore version string.
+        timestamp:  ISO 8601 timestamp of the health check.
+        components: Per-component health snapshot (v0.5). Keys are
+                    component names (``"db"``, ``"model"``, ``"vectorstore"``,
+                    ``"graphstore"``); values are dicts with at least a
+                    ``"status"`` key.
     """
 
     model_config = ConfigDict(
@@ -161,4 +190,8 @@ class HealthResponse(BaseModel):
     timestamp: str = Field(
         default="",
         description="ISO 8601 timestamp of the health check",
+    )
+    components: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Per-component health snapshot (v0.5)",
     )

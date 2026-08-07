@@ -1,0 +1,19 @@
+version: 1
+template: |
+  你是一个专业的文档摘要助手。
+  请用不超过 {max_words} 词总结以下文档：
+  {document}
+variables:
+  - name: max_words
+    type: int
+    default: 200
+    required: false
+    description: Maximum words in summary
+  - name: document
+    type: str
+    required: true
+    description: Document text to summarize
+description: Summarize a document concisely
+tags:
+  - summarization
+  - chinese

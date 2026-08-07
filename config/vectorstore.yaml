@@ -1,0 +1,30 @@
+# icore vectorstore configuration
+# =============================================================================
+# Backend: "milvus" or "memory" (default: "memory")
+#   - "memory": InMemoryVectorStore (no external deps, for dev/demo/tests)
+#   - "milvus": MilvusAdapter     (requires pymilvus + running Milvus server)
+# =============================================================================
+
+backend: memory
+
+# ---------------------------------------------------------------------------
+# Milvus settings (used only when backend == "milvus")
+# ---------------------------------------------------------------------------
+milvus:
+  host: ${MILVUS_HOST}
+  port: 19530
+  db_name: icore
+  default_index_type: IVF_FLAT   # HNSW / IVF_FLAT / IVF_PQ
+  default_metric: COSINE          # COSINE / L2 / IP
+  pool_size: 10
+
+# ---------------------------------------------------------------------------
+# Pre-defined collections (created on first use via create_collection)
+# ---------------------------------------------------------------------------
+collections:
+  - name: doc_embeddings
+    dim: 1536               # OpenAI text-embedding-3-small
+    index_type: HNSW
+  - name: image_embeddings
+    dim: 1024               # CLIP / ViT 常用维度
+    index_type: IVF_FLAT

@@ -48,6 +48,8 @@ coverage.xml
 *.cover
 .hypothesis/
 pytest_out*.txt
+pytest_*.txt
+_tmp_*
 
 # Type checkers / linters
 .mypy_cache/

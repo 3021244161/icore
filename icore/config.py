@@ -142,6 +142,15 @@ class ModelConfig(BaseSettings):
     model_name: str = Field(description="Model name for API calls (e.g. gpt-4o)")
     api_base: str = Field(description="OpenAI-compatible API base URL")
     api_key: str = Field(description="API key")
+    model_type: str = Field(
+        default="openai",
+        description=(
+            "Adapter type selector. v0.5 supports 'openai' (default, "
+            "text-only) and 'vision' (multimodal vision-capable). "
+            "Custom types can be registered via "
+            "ModelManager.register_adapter_type()."
+        ),
+    )
     max_tokens: int = Field(default=4096, ge=1)
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     request_timeout: int = Field(default=120, ge=1)
@@ -214,6 +223,300 @@ class LoggingSettings(BaseSettings):
 
 
 # ---------------------------------------------------------------------------
+# Sub-settings: v0.6 Engineering enhancements
+# ---------------------------------------------------------------------------
+
+class BackpressureSettings(BaseSettings):
+    """v0.6 §3.2 full-stack backpressure configuration."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="ICORE_BACKPRESSURE_",
+        env_file=".env",
+        extra="ignore",
+    )
+
+    enabled: bool = Field(
+        default=True, description="Enable the BackpressureCoordinator"
+    )
+    memory_budget_mb: float = Field(
+        default=0.0,
+        description=(
+            "Soft RSS ceiling in MB. 0 disables memory-based backpressure. "
+            "When exceeded, /health returns 'saturated' and /invoke "
+            "returns HTTP 503."
+        ),
+    )
+    check_interval: float = Field(
+        default=5.0, description="Seconds between RSS saturation checks"
+    )
+    # Per-component budgets (model_id / collection name is the unit).
+    llm_max_concurrent: int = Field(
+        default=20, description="Max concurrent calls per LLM model_id"
+    )
+    vector_max_concurrent: int = Field(
+        default=20, description="Max concurrent Milvus queries"
+    )
+    graph_max_concurrent: int = Field(
+        default=20, description="Max concurrent Neo4j queries"
+    )
+    db_max_concurrent: int = Field(
+        default=20, description="Max concurrent DB queries per connection"
+    )
+
+
+class HotReloadSettings(BaseSettings):
+    """v0.6 §3.3.1 configuration hot reload."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="ICORE_HOT_RELOAD_",
+        env_file=".env",
+        extra="ignore",
+    )
+
+    enabled: bool = Field(default=True, description="Enable hot reload")
+    use_watchdog: bool = Field(
+        default=True,
+        description=(
+            "Try to use the watchdog library for file watching. "
+            "Falls back to mtime polling when watchdog is unavailable."
+        ),
+    )
+    poll_interval: float = Field(
+        default=1.0, description="Polling interval in seconds (fallback mode)"
+    )
+    debounce_sec: float = Field(
+        default=0.5, description="Debounce window for change events"
+    )
+
+
+class DegradationSettings(BaseSettings):
+    """v0.6 §3.3.2 graceful degradation."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="ICORE_DEGRADATION_",
+        env_file=".env",
+        extra="ignore",
+    )
+
+    enabled: bool = Field(
+        default=True, description="Enable graceful degradation coordinator"
+    )
+    failure_threshold: int = Field(
+        default=3,
+        description="Consecutive failures before degrading to fallback",
+    )
+    recovery_interval: float = Field(
+        default=30.0,
+        description="Seconds between primary health probes (auto-recovery)",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Sub-settings: v0.6 module wirings (auth / observability / persistence /
+# dlq / cache / security / triggers). All default OFF or InMemory so the
+# existing test path (infrastructure-free) stays unaffected.
+# ---------------------------------------------------------------------------
+
+class AuthSettings(BaseSettings):
+    """v0.6 §2.6 authentication / RBAC configuration.
+
+    Disabled by default to preserve the existing infrastructure-free test
+    path. Enable in production via ``ICORE_AUTH_ENABLED=true``.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="ICORE_AUTH_", env_file=".env", extra="ignore"
+    )
+
+    enabled: bool = Field(default=False, description="Enable API auth on /invoke")
+    mode: str = Field(
+        default="api_key",
+        description="Auth mode: 'api_key' or 'jwt' or 'both'",
+    )
+    api_keys_file: str = Field(
+        default="users.yaml",
+        description="YAML file under config_dir mapping user -> api_key",
+    )
+    jwt_secret: str = Field(
+        default="",
+        description="HS256 signing secret for JWT (empty disables JWT)",
+    )
+    jwt_algorithm: str = Field(default="HS256")
+    jwt_expires_in: int = Field(default=3600, description="JWT lifetime in seconds")
+    required_permission: str = Field(
+        default="invoke",
+        description="RBAC permission required to call /invoke",
+    )
+
+
+class ObservabilitySettings(BaseSettings):
+    """v0.6 §2.1 observability (metrics / tracing / structured logs)."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="ICORE_OBSERVABILITY_", env_file=".env", extra="ignore"
+    )
+
+    enabled: bool = Field(
+        default=True,
+        description=(
+            "Enable observability: install MetricsMiddleware + "
+            "RequestIDMiddleware and expose GET /metrics. When False, "
+            "no middleware is installed and /metrics returns 404."
+        ),
+    )
+    json_logs: bool = Field(
+        default=False,
+        description=(
+            "Emit structured JSON logs via JsonFormatter. False keeps "
+            "the default logging format (zero-dependency, AGENTS.md §2)."
+        ),
+    )
+    log_level: str = Field(default="INFO")
+    log_dir: str = Field(
+        default="", description="Optional log directory for file handlers"
+    )
+    metrics_path: str = Field(default="/metrics")
+
+
+class PersistenceSettings(BaseSettings):
+    """v0.6 §2.4 workflow execution persistence."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="ICORE_PERSISTENCE_", env_file=".env", extra="ignore"
+    )
+
+    enabled: bool = Field(
+        default=True,
+        description=(
+            "Persist every /invoke execution + per-node checkpoint. "
+            "Uses InMemory backend by default; switch to 'postgres' for "
+            "production durability."
+        ),
+    )
+    backend: str = Field(
+        default="memory",
+        description="Backend: 'memory' or 'postgres'",
+    )
+    postgres_dsn: str = Field(
+        default="",
+        description="PostgreSQL DSN when backend='postgres'",
+    )
+    history_default_limit: int = Field(
+        default=100, description="Default page size for /history"
+    )
+    history_max_limit: int = Field(
+        default=500, description="Maximum page size for /history"
+    )
+
+
+class DLQSettings(BaseSettings):
+    """v0.6 §3.1.2 dead letter queue."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="ICORE_DLQ_", env_file=".env", extra="ignore"
+    )
+
+    enabled: bool = Field(
+        default=True,
+        description=(
+            "Enqueue nodes that exhausted all retries into the DLQ. "
+            "InMemory backend by default."
+        ),
+    )
+    backend: str = Field(
+        default="memory",
+        description="Backend: 'memory' or 'postgres'",
+    )
+    postgres_dsn: str = Field(
+        default="", description="PostgreSQL DSN when backend='postgres'"
+    )
+    default_ttl_seconds: float = Field(
+        default=7 * 24 * 3600.0,
+        description="Default TTL for DLQ entries (7 days)",
+    )
+
+
+class CacheSettings(BaseSettings):
+    """v0.6 §2.3 LLM response semantic cache."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="ICORE_CACHE_", env_file=".env", extra="ignore"
+    )
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "Wrap model adapters with CachedModelAdapter. Disabled by "
+            "default to avoid changing LLM behavior in tests."
+        ),
+    )
+    enable_l1: bool = Field(default=True, description="Enable L1 exact match")
+    enable_l2: bool = Field(
+        default=False,
+        description=(
+            "Enable L2 vector similarity. Requires a vectorstore + "
+            "embed_fn; auto-disabled when those are unavailable."
+        ),
+    )
+    similarity_threshold: float = Field(default=0.95)
+    l1_max_size: int = Field(default=1000)
+    default_ttl: float = Field(default=3600.0)
+
+
+class SecuritySettings(BaseSettings):
+    """v0.6 §3.5 prompt injection + PII masking."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="ICORE_SECURITY_", env_file=".env", extra="ignore"
+    )
+
+    injection_detection: bool = Field(
+        default=False,
+        description=(
+            "Scan invoke params for prompt injection; reject with 400. "
+            "Disabled by default to avoid false positives in tests."
+        ),
+    )
+    injection_threshold: float = Field(
+        default=0.7, description="Confidence threshold for injection rejection"
+    )
+    pii_masking: bool = Field(
+        default=False,
+        description=(
+            "Mask PII in invoke params before sending to LLM, then unmask "
+            "in the response. Disabled by default."
+        ),
+    )
+    pii_enabled_categories: str = Field(
+        default="",
+        description=(
+            "Comma-separated PII categories to enable (empty = all). "
+            "Categories: phone, id_card, email, api_key, bank_card"
+        ),
+    )
+
+
+class TriggersSettings(BaseSettings):
+    """v0.6 §2.5 message queue triggers."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="ICORE_TRIGGERS_", env_file=".env", extra="ignore"
+    )
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "Build + start TriggerManager from config/triggers.yaml. "
+            "Disabled by default; enable only when triggers.yaml exists."
+        ),
+    )
+    config_file: str = Field(
+        default="triggers.yaml",
+        description="YAML file under config_dir listing triggers",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Top-level settings
 # ---------------------------------------------------------------------------
 
@@ -258,6 +561,18 @@ class Settings(BaseSettings):
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)
     model: ModelSettings = Field(default_factory=ModelSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
+    # v0.6 engineering enhancements
+    backpressure: BackpressureSettings = Field(default_factory=BackpressureSettings)
+    hot_reload: HotReloadSettings = Field(default_factory=HotReloadSettings)
+    degradation: DegradationSettings = Field(default_factory=DegradationSettings)
+    # v0.6 module wirings (all default OFF / InMemory so existing tests stay green)
+    auth: AuthSettings = Field(default_factory=AuthSettings)
+    observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
+    persistence: PersistenceSettings = Field(default_factory=PersistenceSettings)
+    dlq: DLQSettings = Field(default_factory=DLQSettings)
+    cache: CacheSettings = Field(default_factory=CacheSettings)
+    security: SecuritySettings = Field(default_factory=SecuritySettings)
+    triggers: TriggersSettings = Field(default_factory=TriggersSettings)
 
     @classmethod
     def load_from_yaml(cls, yaml_path: str | Path) -> Dict[str, Any]:

@@ -1,0 +1,178 @@
+# icore — full stack compose (icore + PG + Redis + Milvus + Neo4j + MinIO).
+#
+# One-line bring-up of the entire v0.6 reference topology:
+#
+#     docker-compose -f deploy/docker-compose.full.yaml up -d
+#
+# After ~30 seconds the following endpoints are available:
+#
+#     icore API  -> http://localhost:8000/docs
+#     PostgreSQL -> localhost:5432       (icore / icore)
+#     Redis      -> localhost:6379
+#     Milvus     -> localhost:19530      (Attu UI: http://localhost:8001)
+#     Neo4j      -> http://localhost:7474 (browser)
+#                 -> bolt://localhost:7687
+#     MinIO      -> http://localhost:9001 (console)
+#                 -> localhost:9000       (S3 API)
+#
+# All services persist data to named volumes so a `down` does not lose
+# state. Use `docker-compose -f deploy/docker-compose.full.yaml down -v`
+# to wipe the volumes for a clean slate.
+
+version: "3.9"
+
+services:
+  icore:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: icore:latest
+    container_name: icore
+    ports:
+      - "8000:8000"
+    environment:
+      ICORE_API_HOST: 0.0.0.0
+      ICORE_API_PORT: 8000
+      ICORE_LOG_LEVEL: INFO
+      # Concurrency: use Redis for distributed queue + lock.
+      ICORE_CONCURRENCY_TASK_QUEUE_BACKEND: redis
+      ICORE_CONCURRENCY_REDIS_URL: redis://redis:6379/0
+      # v0.6 engineering enhancements.
+      ICORE_BACKPRESSURE_ENABLED: "true"
+      ICORE_BACKPRESSURE_MEMORY_BUDGET_MB: "2048"
+      ICORE_BACKPRESSURE_LLM_MAX_CONCURRENT: "20"
+      ICORE_BACKPRESSURE_VECTOR_MAX_CONCURRENT: "20"
+      ICORE_BACKPRESSURE_GRAPH_MAX_CONCURRENT: "20"
+      ICORE_BACKPRESSURE_DB_MAX_CONCURRENT: "20"
+      ICORE_HOT_RELOAD_ENABLED: "true"
+      ICORE_HOT_RELOAD_USE_WATCHDOG: "true"
+      ICORE_DEGRADATION_ENABLED: "true"
+      ICORE_DEGRADATION_FAILURE_THRESHOLD: "3"
+      ICORE_DEGRADATION_RECOVERY_INTERVAL: "30"
+      # DB / models secrets are read from the .env file at the project root.
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-sk-replace-me}
+      DB_USER: ${DB_USER:-icore}
+      DB_PASSWORD: ${DB_PASSWORD:-icore}
+    volumes:
+      - ../config:/app/config:ro
+      - icore-logs:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request, sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: icore-postgres
+    environment:
+      POSTGRES_USER: ${DB_USER:-icore}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-icore}
+      POSTGRES_DB: icore
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-icore} -d icore"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: icore-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:latest
+    container_name: icore-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Web console
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Milvus standalone (vector store). Depends on etcd + minio (internal).
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.5
+    container_name: icore-milvus-etcd
+    environment:
+      ETCD_AUTO_COMPACTION_MODE: revision
+      ETCD_AUTO_COMPACTION_RETENTION: "1000"
+      ETCD_QUOTA_BACKEND_BYTES: "4294967296"
+      ETCD_SNAPSHOT_COUNT: "50000"
+    command: etcd -advertise-client-urls=http://etcd:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    volumes:
+      - etcd-data:/etcd
+    restart: unless-stopped
+
+  milvus:
+    image: milvusdb/milvus:v2.4.10
+    container_name: icore-milvus
+    command: ["milvus", "run", "standalone"]
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+    ports:
+      - "19530:19530"  # gRPC
+      - "8001:8001"    # Attu UI (browser)
+    volumes:
+      - milvus-data:/var/lib/milvus
+    depends_on:
+      - etcd
+      - minio
+    restart: unless-stopped
+
+  neo4j:
+    image: neo4j:5.20-community
+    container_name: icore-neo4j
+    environment:
+      NEO4J_AUTH: neo4j/neo4jpassword
+      NEO4J_PLUGINS: '["apoc"]'
+    ports:
+      - "7474:7474"   # HTTP browser
+      - "7687:7687"   # Bolt
+    volumes:
+      - neo4j-data:/data
+      - neo4j-logs:/logs
+    restart: unless-stopped
+
+volumes:
+  icore-logs:
+  postgres-data:
+  redis-data:
+  minio-data:
+  etcd-data:
+  milvus-data:
+  neo4j-data:
+  neo4j-logs:
