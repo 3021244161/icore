@@ -720,6 +720,28 @@ def _register_endpoints(app: FastAPI, api_settings: APISettings) -> None:
                     f"Prompt injection detected: {result.matched_patterns}"
                 )
 
+        # 1a-2. v0.6: PII 脱敏（mask 输入，返回前 unmask 恢复）。
+        # 仅当 pii_detector 接线且 params 非空时执行；mask 的 mapping
+        # 随请求生命周期保存，返回前用同一 mapping 恢复原始值。
+        pii_detector = getattr(app.state, "pii_detector", None)
+        _pii_mapping: dict[str, str] | None = None
+        if pii_detector is not None and request.params:
+            import json as _json
+
+            try:
+                _params_json = _json.dumps(
+                    request.params, ensure_ascii=False
+                )
+                _masked, _pii_mapping = await pii_detector.mask(
+                    _params_json
+                )
+                if _pii_mapping:
+                    request.params = _json.loads(_masked)
+            except Exception as _pii_err:
+                # 脱敏失败不阻塞请求（记录并继续，防御式）
+                logger.warning("PII masking failed, proceeding unmasked: %s", _pii_err)
+                _pii_mapping = None
+
         # 1b. Idempotency short-circuit (v0.5): when the caller supplies
         #     an idempotency_key and a cache is wired, return the cached
         #     response without re-executing the workflow.
@@ -959,6 +981,7 @@ def _register_endpoints(app: FastAPI, api_settings: APISettings) -> None:
                     instance_manager=instance_manager,
                     execution_id=execution_id,
                     checkpoint=resume_checkpoint,
+                    pii_mapping=_pii_mapping,
                 ),
                 app,
             )
@@ -981,10 +1004,28 @@ def _register_endpoints(app: FastAPI, api_settings: APISettings) -> None:
                 execution_id=execution_id,
                 checkpoint=resume_checkpoint,
             )
+            # v0.6: PII unmask — 恢复原始值后再返回。
+            _result_data = result.data if result.is_success else None
+            if _pii_mapping and _result_data is not None:
+                try:
+                    import json as _json
+
+                    _result_json = _json.dumps(
+                        _result_data, ensure_ascii=False
+                    )
+                    _restored = await pii_detector.unmask(
+                        _result_json, _pii_mapping
+                    )
+                    _result_data = _json.loads(_restored)
+                except Exception as _pii_unmask_err:
+                    logger.warning(
+                        "PII unmask failed, returning masked result: %s",
+                        _pii_unmask_err,
+                    )
             response = InvokeResponse(
                 task_id=task_id,
                 status=result.status,
-                result=result.data if result.is_success else None,
+                result=_result_data if result.is_success else None,
                 error=result.error,
             )
             # v0.6: persistence 落库（完成/失败）
@@ -1110,6 +1151,7 @@ async def _execute_with_callback(
     instance_manager: Any = None,
     execution_id: str | None = None,
     checkpoint: dict[str, Any] | None = None,
+    pii_mapping: dict[str, str] | None = None,
 ) -> None:
     """
     Execute workflow in background and deliver result to callback URL.
@@ -1131,6 +1173,7 @@ async def _execute_with_callback(
         controller:       Optional ConcurrencyController.
         instance_manager: Optional TaskInstanceManager.
         checkpoint:       Optional resume checkpoint (v0.6).
+        pii_mapping:      Optional PII mask mapping to restore (v0.6).
     """
     wf_name = getattr(workflow, "name", ctx.workflow_id)
     try:
@@ -1150,6 +1193,22 @@ async def _execute_with_callback(
             "result": result.data,
             "error": result.error,
         }
+        # v0.6: callback 模式同样做 PII unmask（用 invoke 端点传入的 mapping）。
+        if pii_mapping and payload.get("result") is not None:
+            try:
+                import json as _json
+
+                _cb_pii = getattr(app.state, "pii_detector", None)
+                _cb_text = _json.dumps(
+                    payload["result"], ensure_ascii=False
+                )
+                if _cb_pii is not None and "<<PII:" in _cb_text:
+                    _cb_restored = await _cb_pii.unmask(_cb_text, pii_mapping)
+                    payload["result"] = _json.loads(_cb_restored)
+            except Exception as _pii_cb_err:  # noqa: BLE001 - best-effort
+                logger.warning(
+                    "Callback PII unmask failed: %s", _pii_cb_err
+                )
     except Exception as e:
         logger.error(
             "Background workflow execution failed: %s", e, exc_info=True

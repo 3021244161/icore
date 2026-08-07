@@ -465,7 +465,13 @@ class WorkflowExecutor:
                 task_name=_task_name,
                 model_id=_model_id,
             ):
-                # Route to sub-workflow or task execution
+                # Route to agent, sub-workflow or task execution
+                if getattr(node, "is_agent", False):
+                    return await self._execute_agent(
+                        node, parent_ctx, params, upstream_outputs,
+                        model_manager, db_manager,
+                    )
+
                 if node.is_subworkflow:
                     return await self._execute_subworkflow(
                         node, parent_ctx, params, upstream_outputs,
@@ -502,6 +508,15 @@ class WorkflowExecutor:
         Implements retry logic: if execute() fails and retries > 0,
         the task is re-instantiated and re-executed up to retries times.
         """
+        # 保护：is_agent=True 的节点不应落入普通 task 路径。
+        if getattr(node, "is_agent", False):
+            return BaseTaskOutput.failure(
+                f"Node '{node.node_id}' is an Agent node; it must be "
+                f"routed to AgentNodeExecutor (engine does this "
+                f"automatically). Falling back to task execution is "
+                f"not allowed."
+            )
+
         # Look up the task class
         try:
             task_cls = self._task_registry.get(node.task_name)
@@ -618,6 +633,99 @@ class WorkflowExecutor:
                     continue
 
         # All retries exhausted
+        return BaseTaskOutput.failure(last_error or "Unknown error")
+
+    async def _execute_agent(
+        self,
+        node: DAGNode,
+        parent_ctx: TaskContext,
+        params: dict[str, Any],
+        upstream_outputs: dict[str, BaseTaskOutput],
+        model_manager: Any,
+        db_manager: Any,
+    ) -> BaseTaskOutput:
+        """
+        Execute an Agent node through ``AgentNodeExecutor``.
+
+        v0.6: Agent 节点是一等公民。``_execute_node`` 检测
+        ``node.is_agent`` 后路由到这里，走与普通节点相同的引擎
+        能力（child context / retry / timeout / persistence / DLQ /
+        metrics）。上游输出取第一个前驱节点的结果作为
+        ``upstream_output``（与 agent_demo 原实现一致）。
+        """
+        from icore.engine.agent import AgentNodeExecutor
+
+        config = getattr(node, "agent_config", None)
+        if config is None:
+            config = node.metadata.get("agent_config") if node.metadata else None
+        if config is None:
+            return BaseTaskOutput.failure(
+                f"Agent node '{node.node_id}' has no agent_config"
+            )
+
+        upstream_out = next(iter(upstream_outputs.values()), None)
+        executor = AgentNodeExecutor(task_registry=self._task_registry)
+
+        # Retry loop (same semantics as _execute_task: retries on failure).
+        last_error: str | None = None
+        max_attempts = node.retries + 1
+
+        for attempt in range(1, max_attempts + 1):
+            logger.info(
+                "Executing agent node '%s' (mode=%s, attempt %d/%d)",
+                node.node_id,
+                config.mode.value,
+                attempt,
+                max_attempts,
+            )
+            node_ctx = self._create_node_context(
+                node, parent_ctx, model_manager, db_manager
+            )
+            try:
+                agent_result = await executor.execute(
+                    config,
+                    node_ctx,
+                    upstream_output=upstream_out,
+                    params=params,
+                    node_timeout=node.timeout,
+                )
+                output = agent_result.output
+                if output is not None and output.is_success:
+                    return output
+                last_error = (
+                    output.error
+                    if output is not None and output.error
+                    else f"Agent node '{node.node_id}' failed "
+                    f"(reason={agent_result.finish_reason})"
+                )
+                if attempt < max_attempts:
+                    logger.warning(
+                        "Agent node '%s' failed (attempt %d), retrying: %s",
+                        node.node_id,
+                        attempt,
+                        last_error,
+                    )
+                    continue
+                return BaseTaskOutput.failure(last_error)
+            except asyncio.TimeoutError:
+                last_error = (
+                    f"Agent node '{node.node_id}' timed out after "
+                    f"{node.timeout}s"
+                )
+                logger.warning(last_error)
+                if attempt < max_attempts:
+                    continue
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                last_error = (
+                    f"Agent node '{node.node_id}' failed: "
+                    f"{type(e).__name__}: {e}"
+                )
+                logger.error(last_error, exc_info=True)
+                if attempt < max_attempts:
+                    continue
+
         return BaseTaskOutput.failure(last_error or "Unknown error")
 
     async def _execute_subworkflow(

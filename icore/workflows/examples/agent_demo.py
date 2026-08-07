@@ -11,12 +11,12 @@ Example 1 — ``data_analysis_agent`` (REACT):
 
     The agent dynamically decides which analysis tasks to invoke
     (``analyze_trend`` / ``detect_anomalies`` / ``segment_customers``)
-    based on the loaded data. The DAG marks the agent node via
-    ``metadata={"is_agent": True, "agent_config": ...}`` (the existing
-    ``DAGNode`` has no dedicated ``is_agent`` field, so metadata is the
-    integration point). The workflow's ``execute()`` override detects the
-    marker and routes the node through ``AgentNodeExecutor``; ordinary
-    nodes run via the standard task lifecycle.
+    based on the loaded data. The agent node is declared via
+    ``dag.add_node(..., is_agent=True, agent_config=...)`` (v0.6
+    explicit fields); the engine's ``WorkflowExecutor`` routes the node
+    to ``AgentNodeExecutor`` automatically — agent nodes and ordinary
+    task nodes share the same lifecycle (retry / timeout / persistence /
+    DLQ / metrics).
 
 Example 2 — ``code_review_supervisor`` (SUPERVISOR):
     A supervisor LLM decomposes a code-review request and dispatches
@@ -38,13 +38,9 @@ from pydantic import Field
 
 from icore.core.base_task import BaseTask
 from icore.core.models import BaseTaskInput, BaseTaskOutput
-from icore.core.registry import register_task, task_registry
+from icore.core.registry import register_task
 from icore.core.task_context import TaskContext
-from icore.engine.agent import (
-    AgentConfig,
-    AgentMode,
-    AgentNodeExecutor,
-)
+from icore.engine.agent import AgentConfig, AgentMode
 from icore.engine.base_workflow import BaseWorkflow
 from icore.engine.dag import DAG
 from icore.engine.registry import register_workflow
@@ -220,11 +216,11 @@ class GenerateReportTask(BaseTask):
 class DataAnalysisAgentWorkflow(BaseWorkflow):
     """DAG: load_data -> agent_decide -> generate_report.
 
-    ``agent_decide`` is an Agent node (REACT). Because ``DAGNode`` has no
-    dedicated ``is_agent`` field, the node is marked via ``metadata``;
-    the workflow's ``execute()`` override detects the marker and routes
-    the node through ``AgentNodeExecutor`` while ordinary nodes run the
-    standard task lifecycle.
+    ``agent_decide`` is an Agent node (REACT). v0.6 起 ``DAGNode`` 提供
+    显式 ``is_agent`` / ``agent_config`` 字段，声明后引擎
+    ``WorkflowExecutor`` 自动路由到 ``AgentNodeExecutor``，与普通节点
+    共享同一生命周期（retry / timeout / persistence / DLQ / metrics）。
+    本 workflow 不再覆写 ``execute()``，直接使用 ``BaseWorkflow`` 默认实现。
     """
 
     name: ClassVar[str] = "data_analysis_agent"
@@ -238,11 +234,9 @@ class DataAnalysisAgentWorkflow(BaseWorkflow):
 
         dag.add_node("load_data", task_name="load_csv_data")
 
-        # Agent node: the placeholder task_name satisfies DAGNode's
-        # non-empty validation; execute() intercepts via metadata.
-        # DAG.add_node() captures extra kwargs into ``metadata`` via
-        # ``**metadata``, so we pass is_agent / agent_config directly
-        # (not wrapped in a metadata={...} dict, which would nest them).
+        # Agent 节点：v0.6 显式字段 is_agent=True + agent_config。
+        # task_name 用占位符满足 DAGNode 校验；引擎检测 is_agent 后
+        # 路由到 AgentNodeExecutor，不会走普通 task 路径。
         dag.add_node(
             "agent_decide",
             task_name="_agent_node_placeholder",
@@ -273,80 +267,6 @@ class DataAnalysisAgentWorkflow(BaseWorkflow):
         dag.add_edge("load_data", "agent_decide")
         dag.add_edge("agent_decide", "agent_render_report")
         return dag
-
-    async def execute(
-        self, ctx: TaskContext, params: dict[str, Any]
-    ) -> BaseTaskOutput:
-        """Walk the DAG in topological order; dispatch agent nodes to
-        ``AgentNodeExecutor`` and ordinary nodes through the normal task
-        lifecycle."""
-        dag = self.define()
-        dag.validate()
-        agent_executor = AgentNodeExecutor()
-
-        node_outputs: dict[str, BaseTaskOutput] = {}
-        for node_id in dag.topological_sort():
-            node = dag.get_node(node_id)
-            upstream = {
-                pid: node_outputs[pid]
-                for pid in dag.get_predecessors(node_id)
-                if pid in node_outputs
-            }
-
-            if node.metadata.get("is_agent"):
-                config: AgentConfig = node.metadata["agent_config"]
-                upstream_out = next(iter(upstream.values()), None)
-                result = await agent_executor.execute(
-                    config, ctx, upstream_out, params
-                )
-                node_outputs[node_id] = result.output
-                logger.info(
-                    "Agent node '%s' finished: reason=%s, iters=%d, tools=%d",
-                    node_id,
-                    result.finish_reason,
-                    result.iterations,
-                    result.tool_calls,
-                )
-                continue
-
-            node_outputs[node_id] = await self._run_ordinary_node(
-                node, ctx, params, upstream
-            )
-
-        terminals = dag.get_terminal_nodes()
-        if len(terminals) == 1:
-            return node_outputs[terminals[0]]
-        # Multiple terminal nodes: merge under "results".
-        return BaseTaskOutput.success(
-            results={nid: node_outputs[nid].data for nid in terminals}
-        )
-
-    @staticmethod
-    async def _run_ordinary_node(
-        node, ctx: TaskContext, params: dict[str, Any], upstream
-    ) -> BaseTaskOutput:
-        """Run a non-agent DAG node through the standard task lifecycle."""
-        task_cls = task_registry.get(node.task_name)
-        task = task_cls()
-        if node.input_builder is not None:
-            inp = node.input_builder(params, upstream)
-        else:
-            merged = dict(params)
-            for out in upstream.values():
-                if out.is_success and out.data:
-                    merged.update(out.data)
-            try:
-                inp = task_cls.input_model(**merged)
-            except Exception:
-                inp = BaseTaskInput(**merged)
-        try:
-            await task.prepare(ctx)
-            return await task.execute(ctx, inp)
-        finally:
-            try:
-                await task.cleanup(ctx)
-            except Exception:
-                pass
 
 
 # ===========================================================================
@@ -530,29 +450,3 @@ class CodeReviewSupervisorWorkflow(BaseWorkflow):
         dag.add_node("aggregate", task_name="aggregate_review")
         dag.add_edge("review", "aggregate")
         return dag
-
-    async def execute(
-        self, ctx: TaskContext, params: dict[str, Any]
-    ) -> BaseTaskOutput:
-        """Run the supervisor agent, then aggregate the results."""
-        dag = self.define()
-        dag.validate()
-        agent_executor = AgentNodeExecutor()
-
-        # 1. Supervisor agent (decomposes + runs sub-agents in parallel).
-        review_result = await agent_executor.execute(
-            self._supervisor_config(), ctx, None, params
-        )
-
-        # 2. Aggregate task: feed the supervisor's results dict.
-        agg_task = AggregateReviewTask()
-        agg_input = BaseTaskInput(results=review_result.output.data.get("results", {}))
-        try:
-            await agg_task.prepare(ctx)
-            agg_out = await agg_task.execute(ctx, agg_input)
-        finally:
-            try:
-                await agg_task.cleanup(ctx)
-            except Exception:
-                pass
-        return agg_out

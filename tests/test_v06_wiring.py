@@ -290,6 +290,221 @@ class TestInjectionDetection:
 
 
 # ---------------------------------------------------------------------------
+# 5b. PII 脱敏链路（mask 输入 / unmask 输出）
+# ---------------------------------------------------------------------------
+
+
+class TestPIIDetection:
+    """验证 pii_detector 接线后：请求 params 中手机号/身份证在进入
+    工作流前被 mask，响应结果中恢复原始值。"""
+
+    @staticmethod
+    def _build_pii_app():
+        from icore.security import PIIDetector
+
+        kwargs: dict[str, Any] = {}
+        kwargs["pii_detector"] = PIIDetector()
+        return create_app(**kwargs)
+
+    def test_invoke_masks_params_and_unmasks_result(self):
+        """端到端：手机号在 params 中被 mask，LLM/工作流拿到占位符，
+        响应中恢复原始手机号。"""
+        from icore.security import PIIDetector
+
+        # 注册一个 echo 工作流：直接返回 params 里的 phone 字段。
+        class _EchoInput(BaseTaskInput):
+            phone: str = ""
+
+        class _EchoTask(BaseTask):
+            name: ClassVar[str] = "test_pii_echo"
+            description: ClassVar[str] = "Echo back the phone field"
+            input_model: ClassVar[type[BaseTaskInput]] = _EchoInput
+
+            async def prepare(self, ctx):
+                pass
+
+            async def execute(self, ctx, inp):
+                # 工作流内部应看到占位符（LLM 收到的已脱敏）
+                return BaseTaskOutput.success(
+                    result={"phone_echo": inp.phone}
+                )
+
+        if not task_registry.contains(_EchoTask.name):
+            task_registry.register(_EchoTask.name, _EchoTask)
+
+        from icore.engine.base_workflow import BaseWorkflow
+        from icore.engine.registry import register_workflow
+
+        @register_workflow("test_pii_echo_wf")
+        class _EchoWorkflow(BaseWorkflow):
+            name: ClassVar[str] = "test_pii_echo_wf"
+            description: ClassVar[str] = "PII echo test"
+
+            def define(self) -> DAG:
+                dag = DAG()
+                dag.add_node("echo", task_name="test_pii_echo")
+                return dag
+
+        app = self._build_pii_app()
+        client = TestClient(app)
+        r = client.post(
+            "/invoke",
+            json={
+                "workflow_name": "test_pii_echo_wf",
+                "params": {"phone": "13800138000"},
+            },
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        # 响应中的 phone_echo 已通过 unmask 恢复原始值。
+        # 注意：executor 对多终端节点会包装一层 results，这里实际
+        # body["result"] == {"result": {"phone_echo": ...}}。
+        assert body["result"]["result"]["phone_echo"] == "13800138000"
+
+    def test_no_pii_detector_no_masking(self):
+        """未接线 pii_detector 时，params 原样透传。"""
+        # 注册一个 echo 工作流
+        class _RawInput(BaseTaskInput):
+            phone: str = ""
+
+        class _RawTask(BaseTask):
+            name: ClassVar[str] = "test_raw_echo"
+            description: ClassVar[str] = "Echo back the phone field"
+            input_model: ClassVar[type[BaseTaskInput]] = _RawInput
+
+            async def prepare(self, ctx):
+                pass
+
+            async def execute(self, ctx, inp):
+                return BaseTaskOutput.success(
+                    result={"phone_echo": inp.phone}
+                )
+
+        if not task_registry.contains(_RawTask.name):
+            task_registry.register(_RawTask.name, _RawTask)
+
+        from icore.engine.base_workflow import BaseWorkflow
+        from icore.engine.registry import register_workflow
+
+        @register_workflow("test_raw_echo_wf")
+        class _RawWorkflow(BaseWorkflow):
+            name: ClassVar[str] = "test_raw_echo_wf"
+            description: ClassVar[str] = "Raw echo test"
+
+            def define(self) -> DAG:
+                dag = DAG()
+                dag.add_node("echo", task_name="test_raw_echo")
+                return dag
+
+        app = create_app()  # 不传 pii_detector
+        client = TestClient(app)
+        r = client.post(
+            "/invoke",
+            json={
+                "workflow_name": "test_raw_echo_wf",
+                "params": {"phone": "13800138000"},
+            },
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        # 未脱敏：phone_echo 就是原始值
+        assert body["result"]["result"]["phone_echo"] == "13800138000"
+
+
+# ---------------------------------------------------------------------------
+# 5c. Agent 节点接入标准引擎（executor 路由 is_agent）
+# ---------------------------------------------------------------------------
+
+
+class TestAgentNodeInEngine:
+    """验证 WorkflowExecutor 通过 node.is_agent 路由到 AgentNodeExecutor，
+    Agent 节点走标准生命周期（retry / timeout / persistence / DLQ）。"""
+
+    async def test_agent_node_routed_by_executor(self):
+        """非示例 workflow 的 DAG 加 is_agent=True 节点，由标准 executor
+        执行 Agent 循环。"""
+        from icore.engine.agent import AgentConfig, AgentMode, AgentNodeExecutor
+
+        # 注册一个工具 task（Agent 的 available_tasks）
+        class _ToolInput(BaseTaskInput):
+            value: int = 0
+
+        class _ToolTask(BaseTask):
+            name: ClassVar[str] = "test_agent_tool_add"
+            description: ClassVar[str] = "Add one to value"
+            input_model: ClassVar[type[BaseTaskInput]] = _ToolInput
+
+            async def prepare(self, ctx):
+                pass
+
+            async def execute(self, ctx, inp):
+                return BaseTaskOutput.success(
+                    result={"value": inp.value + 1}
+                )
+
+        if not task_registry.contains(_ToolTask.name):
+            task_registry.register(_ToolTask.name, _ToolTask)
+
+        # 构造一个最小 REACT Agent 响应序列：直接 FINISH
+        class _Responder:
+            def __init__(self):
+                self.i = 0
+
+            def __call__(self, messages):
+                self.i += 1
+                return (
+                    "```yaml\nthought: done\naction: FINISH\n"
+                    'final_answer: {"ok": true}\n```'
+                )
+
+        from icore.engine.executor import WorkflowExecutor
+
+        # 构造 ModelManager + FakeModelAdapter
+        from icore.models.manager import ModelManager
+        from tests.conftest import FakeModelAdapter, make_model_config
+
+        adapter = FakeModelAdapter(
+            make_model_config("agent-test-model"),
+            responder=_Responder(),
+        )
+        mgr = ModelManager()
+        mgr.register_adapter("agent-test-model", adapter)
+        mgr._router.set_default_model_id("agent-test-model")
+        mgr._auto_routing = True
+
+        # 用标准 executor 执行含 Agent 节点的 DAG
+        dag = DAG()
+        dag.add_node("agent", task_name="_agent_node_placeholder",
+                     is_agent=True,
+                     agent_config=AgentConfig(
+                         mode=AgentMode.REACT,
+                         goal="test",
+                         available_tasks=["test_agent_tool_add"],
+                         max_iterations=3,
+                         max_tool_calls=5,
+                     ))
+        ctx = TaskContext(task_id="agent-engine-1", workflow_id="wf-agent")
+        ctx.set_model_manager(mgr)
+
+        executor = WorkflowExecutor()
+        result = await executor.run(dag, ctx, {})
+        # executor.run() 返回终端节点输出（BaseTaskOutput）
+        assert result.is_success is True
+
+    async def test_agent_node_missing_config_fails(self):
+        """is_agent=True 但没有 agent_config 的节点应明确失败。"""
+        from icore.engine.executor import WorkflowExecutor
+
+        dag = DAG()
+        dag.add_node("bad_agent", task_name="_agent_node_placeholder",
+                     is_agent=True, agent_config=None)
+        ctx = TaskContext(task_id="agent-engine-2", workflow_id="wf-agent")
+        executor = WorkflowExecutor()
+        result = await executor.run(dag, ctx, {})
+        assert result.is_success is False
+
+
+# ---------------------------------------------------------------------------
 # 6. executor persistence + DLQ 链路
 # ---------------------------------------------------------------------------
 

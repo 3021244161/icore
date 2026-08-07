@@ -298,10 +298,17 @@ class TestBuildModelManager:
         assert len(mgr) >= 2
 
     def test_default_model_id_is_set(self):
-        from icore.bootstrap import build_model_manager
+        from icore.bootstrap import build_model_manager, load_yaml_config
+        from icore.config import Settings
         mgr = build_model_manager()
-        # config/models.yaml sets default_model_id: gpt-4o-mini
-        assert mgr._router._default_model_id == "gpt-4o-mini"
+        # 从 config/models.yaml 动态读取 default_model_id（避免硬编码）。
+        s = Settings()
+        from pathlib import Path
+
+        models_yaml = load_yaml_config(Path(s.config_dir) / "models.yaml")
+        expected = models_yaml.get("default_model_id")
+        assert expected, "config/models.yaml must declare default_model_id"
+        assert mgr._router._default_model_id == expected
 
     def test_routing_rules_loaded(self):
         from icore.bootstrap import build_model_manager
