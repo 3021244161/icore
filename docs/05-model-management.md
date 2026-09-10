@@ -231,11 +231,22 @@ class BaseModelAdapter(abc.ABC):
         "prompt_tokens": 100,
         "completion_tokens": 50,
         "total_tokens": 150,
+        "prompt_cache_hit_tokens": 80,
+        "prompt_cache_miss_tokens": 20,
     },
     "finish_reason": "stop",
     "raw": { ... }  # 原始 API 响应（可选，用于调试）
 }
 ```
+
+> **上下文缓存 token（v0.6.x）：** `usage.prompt_cache_hit_tokens` 与
+> `prompt_cache_miss_tokens` 来自提供方（如 DeepSeek）返回的上下文缓存
+> 命中/未命中 token 数。多轮对话中，请求前缀（如固定的 system prompt）
+> 命中服务端上下文缓存时，命中的输入 token 按更低的缓存价计费，从而
+> 显著降低长对话的成本。这两个字段仅在提供方返回时非零，未命中或
+> 不支持缓存时为 0；适配器同时将它们记录到
+> `icore_model_prompt_cache_hit_tokens_total` /
+> `icore_model_prompt_cache_miss_tokens_total` 指标以便观测。
 
 ---
 

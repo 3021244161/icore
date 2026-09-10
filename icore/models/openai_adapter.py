@@ -251,9 +251,20 @@ class OpenAICompatibleAdapter(BaseModelAdapter):
             usage = data.get("usage", {})
             prompt_tokens = usage.get("prompt_tokens", 0)
             completion_tokens = usage.get("completion_tokens", 0)
+            # v0.6.x: DeepSeek 等提供方返回的上下文缓存命中/未命中 token
+            # （prompt_cache_hit_tokens / prompt_cache_miss_tokens）。多轮对话
+            # 中前缀命中缓存可显著降低输入成本，透传给上层并记录指标以便观测。
+            prompt_cache_hit_tokens = usage.get("prompt_cache_hit_tokens", 0)
+            prompt_cache_miss_tokens = usage.get("prompt_cache_miss_tokens", 0)
 
             _span.set_attribute("prompt_tokens", prompt_tokens)
             _span.set_attribute("completion_tokens", completion_tokens)
+            _span.set_attribute(
+                "prompt_cache_hit_tokens", prompt_cache_hit_tokens
+            )
+            _span.set_attribute(
+                "prompt_cache_miss_tokens", prompt_cache_miss_tokens
+            )
 
             try:
                 _reg = get_metrics_registry()
@@ -263,6 +274,14 @@ class OpenAICompatibleAdapter(BaseModelAdapter):
                 _reg.get_counter("icore_model_tokens_total").inc(
                     model_id=self.model_id, type="completion", n=completion_tokens
                 )
+                if prompt_cache_hit_tokens:
+                    _reg.get_counter(
+                        "icore_model_prompt_cache_hit_tokens_total"
+                    ).inc(model_id=self.model_id, n=prompt_cache_hit_tokens)
+                if prompt_cache_miss_tokens:
+                    _reg.get_counter(
+                        "icore_model_prompt_cache_miss_tokens_total"
+                    ).inc(model_id=self.model_id, n=prompt_cache_miss_tokens)
             except Exception:  # noqa: BLE001 - metrics 不得影响核心逻辑
                 pass
 
@@ -274,6 +293,8 @@ class OpenAICompatibleAdapter(BaseModelAdapter):
                     "prompt_tokens": prompt_tokens,
                     "completion_tokens": completion_tokens,
                     "total_tokens": usage.get("total_tokens", 0),
+                    "prompt_cache_hit_tokens": prompt_cache_hit_tokens,
+                    "prompt_cache_miss_tokens": prompt_cache_miss_tokens,
                 },
                 "finish_reason": choice.get("finish_reason", "stop"),
             }

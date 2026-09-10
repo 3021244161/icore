@@ -5,7 +5,7 @@ icore.observability - v0.6 可观测性体系（Metrics / Tracing / 结构化日
 loguru / opentelemetry / prometheus_client**：
 
     1. **Metrics**：``MetricsRegistry`` 单例注册中心，支持
-       ``Counter`` / ``Histogram`` / ``Gauge`` 三种指标类型，预置 12 个
+       ``Counter`` / ``Histogram`` / ``Gauge`` 三种指标类型，预置 14 个
        v0.6 指标，并通过 ``render_prometheus()`` 输出 Prometheus text
        exposition format。
     2. **Structured Logging**：``JsonFormatter`` 输出结构化 JSON 日志，
@@ -497,7 +497,7 @@ class MetricsRegistry:
     # -- default metrics ---------------------------------------------------
 
     def _register_default_metrics(self) -> None:
-        """Pre-register the 12 v0.6 observability metrics."""
+        """Pre-register the 14 v0.6 observability metrics."""
         self.create_counter(
             "icore_invoke_total",
             "Total number of workflow invocations",
@@ -521,6 +521,19 @@ class MetricsRegistry:
         self.create_counter(
             "icore_model_errors_total",
             "Total LLM model call errors",
+            ("model_id",),
+        )
+        # v0.6.x: 提供方上下文缓存（如 DeepSeek 的 prompt_cache_hit_tokens）
+        # 命中/未命中 token 计数。多轮对话中前缀命中缓存可显著降低输入成本，
+        # 这两个指标用于观测缓存命中率与成本节省效果。
+        self.create_counter(
+            "icore_model_prompt_cache_hit_tokens_total",
+            "Total prompt tokens served from provider context cache",
+            ("model_id",),
+        )
+        self.create_counter(
+            "icore_model_prompt_cache_miss_tokens_total",
+            "Total prompt tokens that missed provider context cache",
             ("model_id",),
         )
         self.create_gauge(

@@ -210,6 +210,8 @@ class TestMetricsRegistry:
             "icore_invoke_total",
             "icore_model_tokens_total",
             "icore_model_errors_total",
+            "icore_model_prompt_cache_hit_tokens_total",
+            "icore_model_prompt_cache_miss_tokens_total",
             "icore_cache_hits_total",
             "icore_cache_misses_total",
         ]:
@@ -667,3 +669,112 @@ class TestPrometheusEndpoint:
     def test_response_body_is_str_or_bytes(self):
         resp = prometheus_response(registry=MetricsRegistry())
         assert isinstance(resp.body, (bytes, str))
+
+
+# ===========================================================================
+# Prompt cache token metrics (DeepSeek prompt_cache_hit_tokens)
+# ===========================================================================
+
+class TestPromptCacheTokenMetrics:
+    """openai_adapter.chat() 解析并记录提供方上下文缓存 token 指标。"""
+
+    @staticmethod
+    def _resp_with_usage(usage: dict[str, int]):
+        class _Resp:
+            status_code = 200
+
+            @staticmethod
+            def json() -> dict[str, Any]:
+                return {
+                    "choices": [
+                        {
+                            "message": {"content": "hi", "role": "assistant"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "model": "deepseek-chat",
+                    "usage": usage,
+                }
+
+        return _Resp()
+
+    @staticmethod
+    def _adapter_with_fake_client(resp: Any):
+        from icore.config import ModelConfig
+        from icore.models.openai_adapter import OpenAICompatibleAdapter
+
+        cfg = ModelConfig(
+            model_id="deepseek",
+            model_name="deepseek-chat",
+            api_base="http://localhost/v1",
+            api_key="k",
+        )
+        adapter = OpenAICompatibleAdapter(cfg)
+
+        async def _fake_client():
+            class _Client:
+                async def post(self, *args: Any, **kwargs: Any):
+                    return resp
+
+            return _Client()
+
+        adapter._get_client = _fake_client  # type: ignore[assignment]
+        return adapter
+
+    async def test_chat_exposes_prompt_cache_tokens(self):
+        _reset_singleton_for_testing()
+        adapter = self._adapter_with_fake_client(
+            self._resp_with_usage({
+                "prompt_tokens": 100,
+                "completion_tokens": 50,
+                "total_tokens": 150,
+                "prompt_cache_hit_tokens": 80,
+                "prompt_cache_miss_tokens": 20,
+            })
+        )
+
+        result = await adapter.chat([{"role": "user", "content": "hi"}])
+
+        assert result["usage"]["prompt_cache_hit_tokens"] == 80
+        assert result["usage"]["prompt_cache_miss_tokens"] == 20
+
+    async def test_chat_records_prompt_cache_metrics(self):
+        _reset_singleton_for_testing()
+        adapter = self._adapter_with_fake_client(
+            self._resp_with_usage({
+                "prompt_tokens": 100,
+                "completion_tokens": 50,
+                "total_tokens": 150,
+                "prompt_cache_hit_tokens": 80,
+                "prompt_cache_miss_tokens": 20,
+            })
+        )
+
+        await adapter.chat([{"role": "user", "content": "hi"}])
+
+        reg = get_metrics_registry()
+        assert reg.get_counter(
+            "icore_model_prompt_cache_hit_tokens_total"
+        ).get(model_id="deepseek") == 80.0
+        assert reg.get_counter(
+            "icore_model_prompt_cache_miss_tokens_total"
+        ).get(model_id="deepseek") == 20.0
+
+    async def test_chat_without_cache_fields_returns_zero(self):
+        _reset_singleton_for_testing()
+        adapter = self._adapter_with_fake_client(
+            self._resp_with_usage({
+                "prompt_tokens": 100,
+                "completion_tokens": 50,
+                "total_tokens": 150,
+            })
+        )
+
+        result = await adapter.chat([{"role": "user", "content": "hi"}])
+
+        assert result["usage"]["prompt_cache_hit_tokens"] == 0
+        assert result["usage"]["prompt_cache_miss_tokens"] == 0
+        hit = get_metrics_registry().get_counter(
+            "icore_model_prompt_cache_hit_tokens_total"
+        ).get(model_id="deepseek")
+        assert hit == 0.0
