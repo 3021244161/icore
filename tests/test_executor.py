@@ -8,6 +8,9 @@ Covers:
     - Retry logic on execute() exceptions
     - Timeout enforcement via node.timeout
     - Conditional branching (edge conditions evaluated)
+    - Conditional diamond join: one/both/none branch selected, failure
+      in one branch still skips the join loudly, linear truncation kept
+      (ICORE-ISSUE-002)
     - Sub-workflow delegation
     - input_builder vs auto-merge input construction
     - get_terminal_output aggregation
@@ -150,6 +153,23 @@ class _RouteB(BaseTask):
         return BaseTaskOutput.success(branch="B")
 
 
+class _JoinEchoInput(BaseTaskInput):
+    names: str = ""
+
+
+class _JoinEchoTask(BaseTask):
+    """Echoes which upstream nodes fed it (for join semantics tests)."""
+    name: ClassVar[str] = "test_join_echo"
+    description: ClassVar[str] = "Echoes upstream node ids"
+    input_model: ClassVar[type[BaseTaskInput]] = _JoinEchoInput
+
+    async def prepare(self, ctx):
+        pass
+
+    async def execute(self, ctx, inp):
+        return BaseTaskOutput.success(joined=inp.names)
+
+
 class _FailingTask(BaseTask):
     name: ClassVar[str] = "test_failing"
     description: ClassVar[str] = "Always fails"
@@ -176,7 +196,7 @@ def _ensure_test_tasks_registered() -> None:
     _register_called = True
     # Only register if not already present
     for cls in (_AddTask, _FlakyTask, _SlowTask, _ClassifyTask,
-                _RouteA, _RouteB, _FailingTask):
+                _RouteA, _RouteB, _JoinEchoTask, _FailingTask):
         if not task_registry.contains(cls.name):
             task_registry.register(cls.name, cls)
 
@@ -502,6 +522,122 @@ class TestExecutorConditional:
         result_b = await executor.run(dag, ctx, {"label": "B"})
         assert result_b.is_success is True
         assert result_b.data["branch"] == "B"
+
+
+# ---------------------------------------------------------------------------
+# Conditional diamond join (ICORE-ISSUE-002)
+# ---------------------------------------------------------------------------
+
+def _build_diamond(cond_a: bool, cond_b: bool, branch_b_task: str = "test_route_b"):
+    """start →(cond_a) node_a, start →(cond_b) node_b, both → join → end.
+
+    join echoes the node_ids of the upstreams that actually fed it;
+    end echoes join's output, so the terminal result exposes both hops.
+    """
+    dag = DAG()
+    dag.add_node("start", task_name="test_classify")
+    dag.add_node("node_a", task_name="test_route_a")
+    dag.add_node("node_b", task_name=branch_b_task)
+    dag.add_node("join", task_name="test_join_echo",
+                 input_builder=lambda params, upstream:
+                     _JoinEchoInput(names=",".join(sorted(upstream.keys()))))
+    dag.add_node("end", task_name="test_join_echo",
+                 input_builder=lambda params, upstream:
+                     _JoinEchoInput(names=upstream["join"].data["joined"]))
+
+    dag.add_edge("start", "node_a", condition=lambda out: cond_a)
+    dag.add_edge("start", "node_b", condition=lambda out: cond_b)
+    dag.add_edge("node_a", "join")
+    dag.add_edge("node_b", "join")
+    dag.add_edge("join", "end")
+    return dag
+
+
+class TestExecutorConditionalJoin:
+    """ICORE-ISSUE-002：条件分支 + 菱形汇合（回归守护）。"""
+
+    async def test_diamond_one_branch_selected_join_runs(self):
+        """issue 复现场景：互补条件下，汇合节点及其后继必须照常执行。
+
+        旧语义：node_b 被条件跳过 → join 因"任一前驱跳过"被跳过 →
+        整条链路截断，workflow 以 No terminal nodes 失败。
+        新语义：join 只从已执行分支（node_a）收集输入并继续。
+        """
+        dag = _build_diamond(cond_a=True, cond_b=False)
+        executor = WorkflowExecutor()
+        ctx = _make_ctx()
+
+        result = await executor.run(dag, ctx, {"label": "A"})
+
+        assert result.is_success is True
+        # end 的输入是 join 的输出：join 只看到了 node_a（node_b 未贡献）
+        assert result.data["joined"] == "node_a"
+
+    async def test_diamond_other_branch_selected(self):
+        """互补条件的另一侧：join 只收到 node_b 的输出。"""
+        dag = _build_diamond(cond_a=False, cond_b=True)
+        executor = WorkflowExecutor()
+        ctx = _make_ctx()
+
+        result = await executor.run(dag, ctx, {"label": "B"})
+
+        assert result.is_success is True
+        assert result.data["joined"] == "node_b"
+
+    async def test_diamond_both_branches_selected_join_gets_both(self):
+        """两分支都被选中时，join 收到全部两个上游的输出。"""
+        dag = _build_diamond(cond_a=True, cond_b=True)
+        executor = WorkflowExecutor()
+        ctx = _make_ctx()
+
+        result = await executor.run(dag, ctx, {"label": "A"})
+
+        assert result.is_success is True
+        assert result.data["joined"] == "node_a,node_b"
+
+    async def test_diamond_all_branches_unselected_fails(self):
+        """两分支条件都为假 → 无任何输入路径 → 截断（与线性链一致）。"""
+        dag = _build_diamond(cond_a=False, cond_b=False)
+        executor = WorkflowExecutor()
+        ctx = _make_ctx()
+
+        result = await executor.run(dag, ctx, {"label": "X"})
+
+        assert result.is_success is False
+        assert "No terminal nodes" in (result.error or "")
+
+    async def test_failed_branch_still_skips_join_loudly(self):
+        """失败传播保持响亮：一条分支失败时，join 不得静默跑在部分数据上。
+
+        node_b 失败 → _mark_downstream_skipped 传递性预标记 join/end
+        → workflow 失败且 error 指明失败节点。
+        """
+        dag = _build_diamond(
+            cond_a=True, cond_b=True, branch_b_task="test_failing"
+        )
+        executor = WorkflowExecutor()
+        ctx = _make_ctx()
+
+        result = await executor.run(dag, ctx, {"label": "A"})
+
+        assert result.is_success is False
+        assert "node_b" in (result.error or "")
+
+    async def test_linear_truncation_still_cascades(self):
+        """向后兼容：线性链上条件为假仍级联截断其后继。"""
+        dag = DAG()
+        dag.add_node("start", task_name="test_classify")
+        dag.add_node("mid", task_name="test_route_a")
+        dag.add_node("end", task_name="test_join_echo")
+        dag.add_edge("start", "mid", condition=lambda out: False)
+        dag.add_edge("mid", "end")
+
+        executor = WorkflowExecutor()
+        ctx = _make_ctx()
+        result = await executor.run(dag, ctx, {"label": "A"})
+
+        assert result.is_success is False
+        assert "No terminal nodes" in (result.error or "")
 
 
 # ---------------------------------------------------------------------------

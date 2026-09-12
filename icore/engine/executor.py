@@ -24,9 +24,22 @@ Conditional branching:
     DAG edges can carry a condition predicate (EdgeCondition). After a
     node completes, each outgoing conditional edge is evaluated against
     the node's output. If the condition returns False, the target node
-    is marked SKIPPED. A node is skipped if ANY of its incoming
-    conditional edges evaluates to False; unconditional edges always
-    permit execution.
+    is marked SKIPPED.
+
+    Skip semantics (v0.6.x, ICORE-ISSUE-002 —— 支持菱形分支汇合):
+
+    - A node runs when at least one incoming edge is "active" — i.e. its
+      predecessor completed AND the edge is unconditional or its condition
+      evaluates to True.
+    - A node is skipped when NO incoming edge is active (all predecessors
+      skipped, or all completed predecessors' conditions are False) —
+      AND-join truncation. Linear chains keep the legacy cascade: the
+      single skipped predecessor is "all predecessors".
+    - A condition-skipped sibling does NOT force-skip a fan-in join
+      (diamond merge); it merely contributes no output.
+    - A FAILED predecessor still force-skips its downstream cone
+      (``_mark_downstream_skipped``), so errors stay loud even when a
+      sibling branch completed.
 """
 
 from __future__ import annotations
@@ -1029,9 +1042,17 @@ class WorkflowExecutor:
         """
         Check if a node should be skipped based on conditional edges.
 
-        A node is skipped if:
-            1. Any predecessor was skipped or failed (propagation), OR
-            2. Any conditional incoming edge's condition evaluates to False
+        Skip semantics (v0.6.x, ICORE-ISSUE-002 —— 支持菱形分支汇合):
+
+            1. Any predecessor FAILED -> skip（失败传播保持"响亮"：另一条
+               分支成功也不掩盖错误；通常已由 ``_mark_downstream_skipped``
+               传递性预标记，此处为防御性兜底）。
+            2. ALL predecessors skipped（没有一个完成）-> skip（AND-join
+               截断：没有任何输入路径。线性链上唯一前驱被跳过即"全部
+               被跳过"，与旧语义兼容）。
+            3. 在完成的前驱中：至少一条入边无条件或条件为 True ->
+               执行。**被条件跳过的兄弟分支不会强制跳过汇合节点**
+               （菱形汇合），它只是不贡献输出。
 
         Unconditional edges (condition=None) always permit execution.
         A node with at least one unconditional edge from a completed
@@ -1046,36 +1067,56 @@ class WorkflowExecutor:
 
         has_unconditional_pass = False
         has_conditional_fail = False
+        has_completed_pred = False
+        has_failed_pred = False
 
         for edge in incoming_edges:
             pred_id = edge.source
             pred_state = result.node_states.get(pred_id, TaskState.PENDING)
 
-            # If predecessor was skipped or failed, skip this node
-            if pred_state in (TaskState.SKIPPED, TaskState.FAILED):
-                return True
-
-            # Check conditional edges
-            if edge.condition is not None:
-                pred_output = result.node_outputs.get(pred_id)
-                if pred_output is not None:
-                    try:
-                        if edge.condition(pred_output):
-                            has_unconditional_pass = True
-                        else:
-                            has_conditional_fail = True
-                    except Exception as e:
-                        logger.warning(
-                            "Condition evaluation failed on edge "
-                            "%s -> %s: %s. Treating as not-matching.",
-                            edge.source,
-                            edge.target,
-                            e,
-                        )
-                        has_conditional_fail = True
+            if pred_state == TaskState.FAILED:
+                # ICORE-ISSUE-002: 失败仍然传播，即使其他前驱已成功完成
+                has_failed_pred = True
+            elif pred_state == TaskState.SKIPPED:
+                # ICORE-ISSUE-002: 条件未选中的分支不再强制跳过后继——
+                # 它仅仅不贡献输出。是否跳过由"是否存在已完成前驱"
+                # （AND-join）统一判定，见下方。
+                pass
             else:
-                # Unconditional edge from a completed predecessor
-                has_unconditional_pass = True
+                # Predecessor completed (or defensively PENDING)
+                has_completed_pred = True
+
+                # Check conditional edges
+                if edge.condition is not None:
+                    pred_output = result.node_outputs.get(pred_id)
+                    if pred_output is not None:
+                        try:
+                            if edge.condition(pred_output):
+                                has_unconditional_pass = True
+                            else:
+                                has_conditional_fail = True
+                        except Exception as e:
+                            logger.warning(
+                                "Condition evaluation failed on edge "
+                                "%s -> %s: %s. Treating as not-matching.",
+                                edge.source,
+                                edge.target,
+                                e,
+                            )
+                            has_conditional_fail = True
+                else:
+                    # Unconditional edge from a completed predecessor
+                    has_unconditional_pass = True
+
+        # Failure propagation stays loud regardless of sibling successes.
+        if has_failed_pred:
+            return True
+
+        # AND-join truncation: no predecessor produced output -> no input
+        # path -> skip. (Linear chains: the single skipped predecessor is
+        # "all predecessors", preserving legacy cascade behaviour.)
+        if not has_completed_pred:
+            return True
 
         # If there's at least one unconditional pass, don't skip
         if has_unconditional_pass:

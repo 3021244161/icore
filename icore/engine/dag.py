@@ -355,6 +355,21 @@ class DAG:
         If a condition is provided, the target only executes when the
         condition evaluates to True against the source's output.
 
+        Conditional skip semantics (v0.6.x, ICORE-ISSUE-002 —— 支持
+        菱形分支汇合）::
+
+                       ┌── cond A ──→ node_a ──┐
+            node_start ┤                        ├──→ join ──→ end
+                       └── cond B ──→ node_b ──┘
+
+        - A node runs when at least one incoming edge is "active"
+          (predecessor completed AND edge unconditional / condition True).
+        - A condition-skipped sibling does **not** force-skip a fan-in
+          join — the join runs with the executed branch's output only.
+        - A node is skipped only when NO incoming edge is active
+          (AND-join truncation; linear chains keep the legacy cascade).
+        - A FAILED predecessor still force-skips its downstream cone.
+
         Args:
             source:               Source (predecessor) node ID.
             target:               Target (successor) node ID.

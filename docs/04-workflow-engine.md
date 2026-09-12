@@ -631,12 +631,30 @@ flowchart TD
     LOOP -->|所有边处理完| DONE[继续下一波]
 ```
 
-### 9.3 跳过传播
+### 9.3 跳过传播（v0.6.x 更新，ICORE-ISSUE-002：支持菱形分支汇合）
 
-- 当边条件返回 False 时，目标节点被标记为 `SKIPPED`
-- `SKIPPED` 节点的下游也会被递归标记为 `SKIPPED`（通过 `_skip_descendants`）
-- `FAILED` 节点的下游同样会被递归标记为 `SKIPPED`（不是 `FAILED`，因为它们没有实际执行过）
-- 独立分支不受影响，继续正常执行
+跳过判定在每波执行前对未预标记的节点进行（`_should_skip_node`）：
+
+**节点执行**：至少一条入边"激活"（前驱已完成，且该边无条件或条件为 True）。
+
+**节点跳过（AND-join 截断）**：没有任何激活入边——所有前驱都被跳过，或所有已完成前驱的入边条件均为 False。
+
+| 场景 | 行为 |
+|------|------|
+| 线性链上条件为 False | 该节点 `SKIPPED`，其唯一后继因"所有前驱被跳过"继续级联 `SKIPPED`（与旧语义兼容） |
+| 菱形：互补条件只选中一支 | 未选中分支 `SKIPPED`；**汇合节点照常执行**，只从已执行分支收集输入（被跳过分支不贡献输出） |
+| 菱形：两支都被选中 | 汇合节点收到全部两个上游输出 |
+| 所有分支都未选中 | 汇合节点 `SKIPPED`（无输入路径），级联到终端 → `No terminal nodes produced output` |
+| 某分支节点 `FAILED` | 该失败节点的全部传递后继（含汇合）被 `_mark_downstream_skipped` 预标记 `SKIPPED`，**即使另一分支成功也不掩盖错误** |
+
+```text
+             ┌── cond A ──→ node_a ──┐
+node_start ──┤                        ├──→ join ──→ end
+             └── cond B ──→ node_b ──┘
+```
+
+- `cond A=True, cond B=False` → `node_a`、`join`、`end` 执行；`join` 的上游输入只有 `node_a`
+- `cond A=cond B=False` → `node_a`/`node_b`/`join`/`end` 全部 `SKIPPED`
 
 ### 9.4 条件异常处理
 
