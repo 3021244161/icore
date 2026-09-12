@@ -244,9 +244,48 @@ class SummaryTaskOutput(BaseTaskOutput):
 |------|------|------|
 | `extra` | `"allow"` | 允许子类添加业务字段，也允许 API 层传入额外参数 |
 | `arbitrary_types_allowed` | `True` | 允许字段使用非 Pydantic 原生类型（如自定义对象） |
-| `use_enum_values` | `True` | 枚举字段自动转为值，方便 JSON 序列化 |
+| `use_enum_values` | `True` | 枚举字段自动转为值，方便 JSON 序列化（含纯 `Enum` 字段的输入可被持久化层 `json.dumps` 无兜底序列化） |
+| `validate_assignment` | `True` | 构造后对字段赋值会重新校验，非法值抛 `ValidationError` 而非静默接受 |
 
 子类通过添加 `Field` 来定义自己的输入字段，Pydantic 自动处理类型校验、默认值、描述等。
+
+#### 4.2.1 枚举字段契约（ICORE-ISSUE-001，重要）
+
+`use_enum_values=True` 意味着：**枚举字段在输入实例上的类型是 `.value`（`str` / `int`），不是枚举成员**。这是静默的类型契约变更：
+
+```python
+class MyInput(BaseTaskInput):
+    policy: Policy = Policy.A
+
+inp = MyInput(policy=Policy.B)
+inp.policy is Policy.B    # False  ← 静默失效，无任何告警
+inp.policy == Policy.B    # True   ← str/int 基枚举的值比较仍成立
+```
+
+消费方两种正确写法（在默认契约下）：
+
+- **值比较**：`if inp.policy == Policy.B:`
+- **归一化**：`if Policy(inp.policy) is Policy.B:`（推荐，zGo 采用的模式，两态兼容）
+
+需要按枚举身份（`is`）分支时，声明输入类时显式开启 `strict_enums`：
+
+```python
+class MyInput(BaseTaskInput, strict_enums=True):
+    policy: Policy = Policy.A
+
+MyInput(policy=Policy.B).policy is Policy.B   # True
+```
+
+`strict_enums` 只作用于声明该开关的类本身；基类与兄弟类保持默认降级行为。注意事项：
+
+- 启用后推荐使用 `StrEnum` / `IntEnum`（Python 3.10 及以下用 `(str, Enum)` 混入），因为纯 `Enum` 成员不可直接 `json.dumps`（持久化层无 `default=` 兜底），需要 `model_dump(mode="json")` 或自定义序列化；
+- 引擎从 dict 构造输入（`input_model(**task_input)`）时，strict 模式会把值自动还原为枚举成员；
+- `validate_assignment=True` 在两种模式下均拦截非法赋值。
+
+其余配置项语义（见 `BaseTaskInput` docstring）：
+
+- `extra="allow"`：构造时传入的未知字段被保留为属性（不报错），API 层可透传额外元数据；
+- `arbitrary_types_allowed=True`：允许非 Pydantic 原生类型字段（仅赋值、不校验）。
 
 ### 4.3 输出模型设计
 

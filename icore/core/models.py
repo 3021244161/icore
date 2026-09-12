@@ -12,7 +12,10 @@ Key design decisions:
     - arbitrary_types_allowed=True: Allows non-Pydantic-native types in
       fields (e.g. custom objects, numpy arrays).
     - use_enum_values=True: Enum fields are serialized as their values,
-      making JSON responses clean.
+      making JSON responses clean. NOTE: under this default, enum fields
+      are stored as their ``.value`` (``str``/``int``), NOT enum members --
+      see the BaseTaskInput docstring for the full contract (including the
+      ``strict_enums`` opt-in switch) before branching on enum identity.
 """
 
 from __future__ import annotations
@@ -32,8 +35,43 @@ class BaseTaskInput(BaseModel):
             document: str = Field(description="Document text to summarize")
             max_length: int = Field(default=500)
 
-    The model_config allows extra fields (so API callers can pass additional
-    metadata) and arbitrary types (so tasks can accept complex objects).
+    Model configuration semantics:
+
+        - ``extra="allow"``: unknown fields passed at construction are kept
+          as attributes instead of being rejected. The API layer can
+          therefore forward extra metadata without every task declaring it.
+        - ``arbitrary_types_allowed=True``: fields may use non-Pydantic
+          types (custom objects); they are assigned without validation.
+        - ``use_enum_values=True`` (**default**): enum fields are stored as
+          their ``.value`` (``str`` / ``int``), never as enum members.
+          Rationale: task inputs are JSON-serialised by the persistence
+          layer (``json.dumps`` without a ``default=`` fallback), so raw
+          ``Enum`` members would crash persistence for non-``str``/``int``
+          based enums.
+          **Contract caveat (ICORE-ISSUE-001):** downstream code must use
+          value comparison (``==``) or normalise via ``MyEnum(inp.field)``
+          -- ``inp.field is MyEnum.X`` is silently ``False`` under this
+          default config.
+        - ``validate_assignment=True``: assigning to a field after
+          construction re-runs validation; an invalid value raises
+          ``ValidationError`` instead of being silently accepted.
+
+    Opting into strong-typed enums (``strict_enums``):
+
+        Tasks whose logic branches on enum identity declare their input
+        class with the ``strict_enums`` class keyword:
+
+            class MyInput(BaseTaskInput, strict_enums=True):
+                policy: Policy = Policy.A
+
+            MyInput(policy=Policy.B).policy is Policy.B   # True
+
+        The flag flips ``use_enum_values`` to ``False`` for that class
+        only -- the base class and sibling classes keep the JSON-safe
+        default. With ``strict_enums=True``, prefer ``StrEnum`` /
+        ``IntEnum`` (or serialise via ``model_dump(mode="json")``), since
+        plain ``Enum`` members are not directly JSON-serialisable and the
+        persistence layer has no ``default=`` fallback.
     """
 
     model_config = ConfigDict(
@@ -42,6 +80,29 @@ class BaseTaskInput(BaseModel):
         use_enum_values=True,
         validate_assignment=True,
     )
+
+    def __init_subclass__(
+        cls, strict_enums: bool = False, **kwargs: Any
+    ) -> None:
+        """
+        Class-creation hook implementing the ``strict_enums`` switch.
+
+        Pydantic's metaclass merges parent and child ``model_config`` into
+        a fresh dict exposed as ``cls.model_config`` *before* ``type.__new__
+        `` fires this hook, and builds the validation schema from that same
+        dict *afterwards* -- so flipping the key in place here is both
+        safe (the parent's config dict is never touched) and effective
+        (the schema is generated with the flipped value). See
+        ICORE-ISSUE-001 (zGo) for the motivation.
+
+        Args:
+            strict_enums: When True, keep enum members instead of coercing
+                them to their ``.value`` for this class only.
+            **kwargs: Forwarded to ``super().__init_subclass__``.
+        """
+        super().__init_subclass__(**kwargs)
+        if strict_enums and cls.model_config.get("use_enum_values"):
+            cls.model_config["use_enum_values"] = False
 
 
 class BaseTaskOutput(BaseModel):
