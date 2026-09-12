@@ -102,6 +102,8 @@ class BaseModelAdapter(abc.ABC):
     def stream_chat(
         self,
         messages: list[dict[str, str]],
+        *,
+        on_usage: Any = None,
         **kwargs: Any,
     ) -> AsyncIterator[str]:
         """
@@ -111,8 +113,21 @@ class BaseModelAdapter(abc.ABC):
         iterates over the returned async iterator to receive tokens
         incrementally (suitable for SSE streaming).
 
+        v0.6.x (ICORE-ISSUE-003): implementations SHOULD support the
+        optional ``on_usage`` callback — invoked at most once, after the
+        stream has been fully consumed, with the provider's usage dict
+        for the call (``prompt_tokens`` / ``completion_tokens`` /
+        ``total_tokens``, plus provider extensions such as DeepSeek's
+        ``prompt_cache_hit_tokens``). Implementations that cannot obtain
+        streaming usage may simply never invoke the callback; callers
+        must treat the absence of the callback as "usage unavailable".
+        Implementations must pop ``on_usage`` out of kwargs (it must
+        never leak into the HTTP payload).
+
         Args:
             messages: OpenAI-format message list.
+            on_usage: Optional callback receiving the final usage dict
+                once the stream completes.
             **kwargs: Additional API parameters.
 
         Yields:

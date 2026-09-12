@@ -113,6 +113,12 @@ class OpenAICompatibleAdapter(BaseModelAdapter):
         v0.6: 显式透传 ``response_format`` / ``tools`` / ``tool_choice``
         结构化输出参数。这些参数由调用方（如 AgentNodeExecutor）传入，
         用于强制模型按 JSON 格式输出，减少解析失败概率。
+
+        v0.6.x (ICORE-ISSUE-003): 流式请求默认附加
+        ``stream_options={"include_usage": True}``（OpenAI 兼容协议，
+        provider 在流末尾的 usage-only chunk 返回精确用量，含 DeepSeek
+        的 prompt_cache_hit_tokens 等扩展字段）。调用方显式传入
+        ``stream_options`` 时以调用方为准（可关闭）。
         """
         payload: dict[str, Any] = {
             "model": kwargs.pop("model_name", self.config.model_name),
@@ -122,6 +128,7 @@ class OpenAICompatibleAdapter(BaseModelAdapter):
         }
         if stream:
             payload["stream"] = True
+            payload.setdefault("stream_options", {"include_usage": True})
         # v0.6: 显式提取结构化输出参数（避免被其他 kwargs 覆盖）。
         for _structured_key in ("response_format", "tools", "tool_choice"):
             if _structured_key in kwargs:
@@ -129,6 +136,39 @@ class OpenAICompatibleAdapter(BaseModelAdapter):
         # Merge any remaining kwargs (top_p, frequency_penalty, etc.)
         payload.update(kwargs)
         return payload
+
+    def _record_usage_metrics(self, usage: dict[str, Any]) -> None:
+        """
+        Record token usage metrics for a completed model call.
+
+        v0.6.x: shared by both chat() and stream_chat() (ICORE-ISSUE-003 —
+        the streaming path previously recorded NO token metrics at all).
+        Best-effort: never raises into the caller.
+        """
+        try:
+            _reg = get_metrics_registry()
+            _reg.get_counter("icore_model_tokens_total").inc(
+                model_id=self.model_id,
+                type="prompt",
+                n=usage.get("prompt_tokens", 0),
+            )
+            _reg.get_counter("icore_model_tokens_total").inc(
+                model_id=self.model_id,
+                type="completion",
+                n=usage.get("completion_tokens", 0),
+            )
+            prompt_cache_hit = usage.get("prompt_cache_hit_tokens", 0)
+            prompt_cache_miss = usage.get("prompt_cache_miss_tokens", 0)
+            if prompt_cache_hit:
+                _reg.get_counter(
+                    "icore_model_prompt_cache_hit_tokens_total"
+                ).inc(model_id=self.model_id, n=prompt_cache_hit)
+            if prompt_cache_miss:
+                _reg.get_counter(
+                    "icore_model_prompt_cache_miss_tokens_total"
+                ).inc(model_id=self.model_id, n=prompt_cache_miss)
+        except Exception:  # noqa: BLE001 - metrics 不得影响核心逻辑
+            pass
 
     async def _retry_async(
         self,
@@ -266,24 +306,7 @@ class OpenAICompatibleAdapter(BaseModelAdapter):
                 "prompt_cache_miss_tokens", prompt_cache_miss_tokens
             )
 
-            try:
-                _reg = get_metrics_registry()
-                _reg.get_counter("icore_model_tokens_total").inc(
-                    model_id=self.model_id, type="prompt", n=prompt_tokens
-                )
-                _reg.get_counter("icore_model_tokens_total").inc(
-                    model_id=self.model_id, type="completion", n=completion_tokens
-                )
-                if prompt_cache_hit_tokens:
-                    _reg.get_counter(
-                        "icore_model_prompt_cache_hit_tokens_total"
-                    ).inc(model_id=self.model_id, n=prompt_cache_hit_tokens)
-                if prompt_cache_miss_tokens:
-                    _reg.get_counter(
-                        "icore_model_prompt_cache_miss_tokens_total"
-                    ).inc(model_id=self.model_id, n=prompt_cache_miss_tokens)
-            except Exception:  # noqa: BLE001 - metrics 不得影响核心逻辑
-                pass
+            self._record_usage_metrics(usage)
 
             return {
                 "content": message.get("content", ""),
@@ -302,6 +325,8 @@ class OpenAICompatibleAdapter(BaseModelAdapter):
     async def stream_chat(
         self,
         messages: list[dict[str, str]],
+        *,
+        on_usage: Any = None,
         **kwargs: Any,
     ) -> AsyncIterator[str]:
         """
@@ -309,11 +334,29 @@ class OpenAICompatibleAdapter(BaseModelAdapter):
 
         Yields content tokens as they arrive from the API. Uses SSE
         stream parsing to extract delta.content from each chunk.
+
+        v0.6.x (ICORE-ISSUE-003): 流式用量透出。
+
+        - 请求默认附加 ``stream_options={"include_usage": True}``，OpenAI
+          兼容协议随后在**流末尾的 usage-only chunk**（``choices=[]``）返回
+          该次调用的精确用量（含 ``prompt_tokens`` / ``completion_tokens``
+          及 DeepSeek 的 ``prompt_cache_hit_tokens`` 等 provider 扩展字段）。
+        - 调用方可传入 ``on_usage`` 回调：流被**完整消费**后回调一次，
+          入参为 provider 返回的原始 usage dict（拷贝）。回调抛出的异常
+          仅记录日志，不影响流本身。
+        - 若 provider 未返回 usage、流中途出错或调用方提前 break，
+          ``on_usage`` 不会被调用（精确记账依赖完整消费）。
+        - 无论是否传 ``on_usage``，捕获到的用量都会记录到 token 指标
+          （``icore_model_tokens_total`` 等）。
         """
         client = await self._get_client()
         payload = self._build_payload(messages, stream=True, **kwargs)
 
+        # 每次尝试（含重试）独立收集 usage；仅成功完成的流会触发回调。
+        usage_holder: dict[str, Any] = {}
+
         async def _do_stream() -> AsyncIterator[str]:
+            usage_holder.clear()
             async with client.stream(
                 "POST", "/chat/completions", json=payload
             ) as resp:
@@ -347,6 +390,14 @@ class OpenAICompatibleAdapter(BaseModelAdapter):
                         )
                         continue
 
+                    # ICORE-ISSUE-003: usage-only chunk（choices=[]）在旧实现
+                    # 被 `if not choices: continue` 丢弃——先捕获 usage。
+                    # 部分 provider 也会把 usage 附在普通 chunk 上，统一
+                    # 以"最后一个非空 usage"为准。
+                    chunk_usage = chunk.get("usage")
+                    if isinstance(chunk_usage, dict):
+                        usage_holder["usage"] = chunk_usage
+
                     choices = chunk.get("choices", [])
                     if not choices:
                         continue
@@ -361,6 +412,20 @@ class OpenAICompatibleAdapter(BaseModelAdapter):
         # partial outputs are not useful.
         async for token in self._retry_stream(_do_stream):
             yield token
+
+        # 流被完整消费：记录指标 + 触发一次性回调。
+        captured = usage_holder.get("usage")
+        if captured:
+            self._record_usage_metrics(captured)
+            if on_usage is not None:
+                try:
+                    on_usage(dict(captured))
+                except Exception as e:  # noqa: BLE001 - 回调不得影响流
+                    logger.warning(
+                        "on_usage callback failed for '%s': %s",
+                        self.model_id,
+                        e,
+                    )
 
     async def _retry_stream(
         self,

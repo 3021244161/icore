@@ -180,7 +180,7 @@ graph TB
 | 方法 | 说明 | 返回类型 |
 |------|------|---------|
 | `chat()` | 同步对话补全（非流式） | `dict`（含 content, usage, model 等字段） |
-| `stream_chat()` | 流式对话补全 | `AsyncIterator[str]`（逐 token 产出） |
+| `stream_chat()` | 流式对话补全 | `AsyncIterator[str]`（逐 token 产出；v0.6.x 起支持 `on_usage` 回调透出精确用量） |
 | `embed()` | 文本向量化 | `list[list[float]]` |
 
 此外，适配器还应实现：
@@ -202,7 +202,13 @@ class BaseModelAdapter(abc.ABC):
         ...
 
     @abc.abstractmethod
-    def stream_chat(self, messages: list[dict[str, str]], **kwargs) -> AsyncIterator[str]:
+    def stream_chat(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        on_usage=None,   # v0.6.x (ICORE-ISSUE-003)：流结束后回调一次
+        **kwargs,
+    ) -> AsyncIterator[str]:
         ...
 
     @abc.abstractmethod
@@ -291,6 +297,30 @@ data: [DONE]
 ```
 
 适配器解析每一行 `data:` 前缀，提取 JSON 中的 `delta.content`，以 `AsyncIterator[str]` 形式逐 token 产出。
+
+### 4.4 流式 usage 透出（v0.6.x，ICORE-ISSUE-003）
+
+`stream_chat()` 支持精确用量记账（此前流式路径完全拿不到 usage，消费方只能估算）：
+
+```python
+usage_box: dict = {}
+
+async for token in adapter.stream_chat(
+    messages, on_usage=lambda u: usage_box.update(u)
+):
+    print(token, end="")
+
+# 流被完整消费后，usage_box 含该次调用的精确用量
+usage_box["prompt_tokens"]            # 100
+usage_box["prompt_cache_hit_tokens"]   # 80（DeepSeek 等提供方扩展字段）
+```
+
+机制与契约：
+
+- **请求侧**：流式 payload 默认附加 `stream_options={"include_usage": True}`（OpenAI 兼容协议；调用方显式传 `stream_options` 可覆盖关闭）。
+- **响应侧**：provider 在流末尾返回 usage-only chunk（`choices=[]`，仅含 `usage`）；适配器捕获之（部分 provider 把 usage 附在普通 chunk 上，统一以最后一个非空 usage 为准）。
+- **回调**：`on_usage(usage_dict)` 在流被**完整消费**后调用至多一次，入参为 provider 原始 usage dict（拷贝）；回调异常仅记日志。若 provider 未返回 usage、流出错或调用方提前 break，回调不会触发（调用方应按"usage 不可得"降级）。
+- **指标**：无论是否传 `on_usage`，捕获到的用量都会记录到 `icore_model_tokens_total`（type=prompt/completion）及 prompt cache 命中/未命中指标——流式路径与 `chat()` 的计量口径一致。
 
 ---
 

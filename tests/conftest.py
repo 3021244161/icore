@@ -103,14 +103,33 @@ class FakeModelAdapter(BaseModelAdapter):
     def stream_chat(
         self,
         messages: list[dict[str, str]],
+        *,
+        on_usage: Any = None,
         **kwargs: Any,
     ) -> AsyncIterator[str]:
+        """Stream tokens; invoke ``on_usage`` once after full consumption.
+
+        v0.6.x (ICORE-ISSUE-003): mirrors the provider contract — the
+        usage dict is delivered at stream end, like the OpenAI-compat
+        usage-only final chunk. Callback exceptions are swallowed.
+        """
+
         async def _gen() -> AsyncIterator[str]:
             for m in reversed(messages):
                 if m.get("role") == "user":
                     for tok in (m.get("content", "")).split():
                         yield tok + " "
-                    return
+                    break  # 找到最后一条 user 消息即止（不 return：
+                    # 流结束后仍需投递 usage，模拟 provider 末尾 chunk）
+            if on_usage is not None:
+                try:
+                    on_usage({
+                        "prompt_tokens": 10,
+                        "completion_tokens": 5,
+                        "total_tokens": 15,
+                    })
+                except Exception:  # noqa: BLE001 - 回调不得影响流
+                    pass
 
         return _gen()
 
