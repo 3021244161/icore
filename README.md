@@ -36,7 +36,7 @@ icore 是一个企业级工作流能力平台，通过编码形式将大模型�
 - **全链路背压（v0.6）**：`BackpressureCoordinator` 为 LLM / Milvus / Neo4j / PG / 内存预算分别配置并发与限流阈值，`/health` 暴露各组件饱和状态
 - **配置热加载（v0.6）**：`HotReloadCoordinator` 监听 `models.yaml` / `prompts/*.yaml` 变化，watchdog / polling 双模式，无需重启
 - **优雅降级矩阵（v0.6）**：`GracefulDegradationCoordinator` 主备 provider 自动切换（LLM→fallback model、Milvus→InMemory、Neo4j→InMemory、Redis→MemoryLock、PG→本地文件），健康探针自动恢复
-- **安全加固（v0.6）**：Prompt 注入检测（关键词 + 启发式 + 模型三层）+ PII 脱敏（手机/身份证/邮箱/API Key）+ 可配置开关
+- **安全加固（v0.6）**：Prompt 注入检测（关键词 + 启发式 + 模型三层）+ PII 脱敏（手机/身份证/邮箱/API Key）+ 通用限流原语（键控固定窗口、内存/Redis 双后端、非阻塞判定，ICORE-ISSUE-005）+ 可配置开关
 - **容器化一键部署（v0.6）**：`docker-compose.full.yaml` 一键拉起 icore + PG + Redis + Milvus + Neo4j + MinIO；`docker-compose.obs.yaml` 拉起 Prometheus + Grafana + Jaeger + Loki；Helm Chart 支持 K8s
 
 ---
@@ -307,7 +307,7 @@ api / services ──-> engine ──-> core
 - **observability**（v0.6）：可观测性（Prometheus metrics、OpenTelemetry tracing、结构化日志）
 - **persistence**（v0.6）：工作流持久化（`workflow_executions` / `task_executions` 表 + 断点续跑）
 - **triggers**（v0.6）：消息队列触发器（Kafka / RabbitMQ -> 工作流）
-- **security**（v0.6）：安全加固（Prompt 注入检测 + PII 脱敏）
+- **security**（v0.6）：安全加固（Prompt 注入检测 + PII 脱敏 + 通用限流原语 `BaseRateLimiter`：内存/Redis 双后端、Lua 原子计数）
 - **engine**：工作流引擎（`BaseWorkflow`、`DAG`、`WorkflowExecutor`、任务队列、并发控制、实例管理、熔断器、分布式锁、Agent 协作框架、退避策略、死信队列、Saga 补偿、全链路背压、配置热加载、优雅降级）
 - **api**：HTTP 接口层（FastAPI 2 端点、Pydantic Schema、回调、SSE 流、幂等键缓存、全局异常中间件、鉴权依赖、`/metrics` 端点）
 - **services**：服务暴露层（MCP、Tool 服务、Streamlit、SSE 适配器）
@@ -362,7 +362,7 @@ api / services ──-> engine ──-> core
 - **Python 源文件**：100+ 个（v0.6 新增 objectstore / auth / cache / prompts / retrieval / observability / persistence / triggers / security / agent / backoff / dead_letter_queue / saga / backpressure / hot_reload / graceful_degradation 等模块）
 - **设计文档**：13 篇（含 80+ 张 Mermaid 图）
 - **代码总量**：~35,000 行
-- **核心抽象基类**：15 个（BaseTask、BaseWorkflow、BaseConnector、BaseModelAdapter、BaseServiceExposer、BaseVectorStore、BaseGraphStore、BaseMediaProcessor、BaseDistributedLock、BaseObjectStore、BaseReranker、BaseDLQBackend、BaseAuthenticator、BaseInjectionDetector、BasePIIDetector）
+- **核心抽象基类**：16 个（BaseTask、BaseWorkflow、BaseConnector、BaseModelAdapter、BaseServiceExposer、BaseVectorStore、BaseGraphStore、BaseMediaProcessor、BaseDistributedLock、BaseObjectStore、BaseReranker、BaseDLQBackend、BaseAuthenticator、BaseInjectionDetector、BasePIIDetector、BaseRateLimiter）
 - **数据库适配器**：4 个（PostgreSQL、Oracle、Hive、MySQL）
 - **向量库适配器**：2 个（Milvus、InMemory）
 - **图库适配器**：2 个（Neo4j、InMemory）

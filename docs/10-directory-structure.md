@@ -60,7 +60,7 @@ icore-design/
     ├── observability/              # v0.6: 可观测性（Prometheus + OTel）
     ├── persistence/                # v0.6: 工作流持久化
     ├── triggers/                   # v0.6: 消息队列触发器
-    ├── security/                   # v0.6: 安全加固（注入检测 / PII 脱敏）
+    ├── security/                   # v0.6: 安全加固（注入检测 / PII 脱敏 / 通用限流原语）
     ├── vectorstore/                # v0.5: 向量数据库层
     ├── graphstore/                 # v0.5: 图数据库层
     ├── media/                      # v0.5: 多模态文件处理层

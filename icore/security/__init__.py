@@ -1,8 +1,7 @@
 """
 icore.security - v0.6 安全加固模块。
 
-提供两大能力，全部基于 Python 标准库 + Pydantic 实现，**不引入外部
-NLP 库**：
+提供三大能力：
 
     1. **Prompt 注入检测**：``InjectionDetector`` 采用三层策略
        （关键词匹配 / 启发式规则 / 可选模型检测），返回
@@ -10,10 +9,15 @@ NLP 库**：
     2. **PII 检测与脱敏**：``PIIDetector`` 基于正则匹配自动检测并
        脱敏手机号 / 身份证 / 邮箱 / API Key / 银行卡号，支持
        ``mask → unmask`` 往复恢复原始值。
+    3. **通用限流原语**（ICORE-ISSUE-005）：``BaseRateLimiter`` /
+       ``MemoryRateLimiter`` / ``RedisRateLimiter`` 提供键控固定
+       窗口、非阻塞判定（``check`` / ``peek`` / ``reset``）与
+       跨实例共享计数（Redis Lua 原子 INCR+PEXPIRE）。
 
 模块依赖：
-    仅依赖标准库（``re`` / ``logging`` / ``inspect``）+ ``icore`` 自身。
-    所有正则在线程级安全使用（``re`` 模块本身线程安全）。
+    仅依赖标准库（``re`` / ``logging`` / ``inspect``）+ ``icore`` 自身
+    （限流指标经 ``icore.observability`` 惰性注册）。所有正则在线程级
+    安全使用（``re`` 模块本身线程安全）。
 """
 
 from __future__ import annotations
@@ -24,10 +28,23 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+from icore.security.rate_limiter import (
+    BaseRateLimiter,
+    MemoryRateLimiter,
+    RateLimitDecision,
+    RedisRateLimiter,
+    create_rate_limiter,
+)
+
 __all__ = [
     "InjectionResult",
     "InjectionDetector",
     "PIIDetector",
+    "RateLimitDecision",
+    "BaseRateLimiter",
+    "MemoryRateLimiter",
+    "RedisRateLimiter",
+    "create_rate_limiter",
 ]
 
 logger = logging.getLogger(__name__)

@@ -382,9 +382,9 @@ _METRIC_KIND_GAUGE = "gauge"
 class MetricsRegistry:
     """Singleton metrics registry.
 
-    Holds all Counter / Histogram / Gauge instances and pre-registers the 12
-    v0.6 icore metrics on construction. ``render_prometheus()`` produces the
-    full Prometheus text exposition payload.
+    Holds all Counter / Histogram / Gauge instances and pre-registers the
+    default icore metrics on construction. ``render_prometheus()`` produces
+    the full Prometheus text exposition payload.
     """
 
     def __init__(self) -> None:
@@ -497,7 +497,7 @@ class MetricsRegistry:
     # -- default metrics ---------------------------------------------------
 
     def _register_default_metrics(self) -> None:
-        """Pre-register the 14 v0.6 observability metrics."""
+        """Register the 15 default icore metrics."""
         self.create_counter(
             "icore_invoke_total",
             "Total number of workflow invocations",
@@ -570,6 +570,14 @@ class MetricsRegistry:
             "icore_cache_misses_total",
             "Total cache misses",
             ("cache_name",),
+        )
+        # ICORE-ISSUE-005: 通用限流原语（键控固定窗口）判定计数。
+        # label 刻意只有 backend/outcome——user_id/ip 等高基数限流键
+        # 绝不能作为 label，否则 Prometheus 序列会爆炸。
+        self.create_counter(
+            "icore_rate_limit_checks_total",
+            "Total rate limit checks (keyed fixed-window primitive)",
+            ("backend", "outcome"),
         )
 
     def reset(self) -> None:
