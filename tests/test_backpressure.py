@@ -283,6 +283,98 @@ class TestCancellationSafety:
 
 
 # ===========================================================================
+# ICORE-ISSUE-006: waiting queue depth observability
+# ===========================================================================
+
+class TestWaitingQueueDepth:
+    """ICORE-ISSUE-006: 等待队列深度（waiting）可观测。
+
+    asyncio.Semaphore 的等待者对外不可见；_ComponentLimiter.acquire
+    自行维护 _waiting（进入等待 +1 / 获得许可或超时 -1），经
+    ComponentStatus.waiting / snapshot() / /health 透出，供消费方
+    以「等待队列深度」驱动降级。
+    """
+
+    def test_waiting_field_defaults_to_zero(self) -> None:
+        st = ComponentStatus(
+            name="x",
+            max_concurrent=1,
+            active=0,
+            available=1,
+            rate_limited=False,
+            saturated=False,
+        )
+        assert st.waiting == 0
+
+    async def test_no_waiting_when_permits_available(self) -> None:
+        coord = BackpressureCoordinator()
+        coord.register(ComponentBudget(name="c", max_concurrent=3))
+        async with coord.acquire("c"):
+            snap = await coord.snapshot()
+            assert snap.components["c"].waiting == 0
+
+    async def test_waiting_counts_queued_acquires(self) -> None:
+        coord = BackpressureCoordinator()
+        coord.register(ComponentBudget(name="c", max_concurrent=1))
+        holder = await coord.acquire("c").__aenter__()
+        waiter = asyncio.create_task(_acquire_nowait(coord, "c"))
+        try:
+            await asyncio.sleep(0.05)  # let the waiter actually queue
+            snap = await coord.snapshot()
+            assert snap.components["c"].waiting == 1
+        finally:
+            await holder.__aexit__(None, None, None)
+        await waiter  # waiter wakes up and takes the permit
+        snap = await coord.snapshot()
+        assert snap.components["c"].waiting == 0
+        assert snap.components["c"].active == 1
+
+    async def test_waiting_counts_multiple_waiters(self) -> None:
+        coord = BackpressureCoordinator()
+        coord.register(ComponentBudget(name="c", max_concurrent=1))
+        holder = await coord.acquire("c").__aenter__()
+        waiters = [
+            asyncio.create_task(_acquire_nowait(coord, "c")) for _ in range(3)
+        ]
+        try:
+            await asyncio.sleep(0.05)
+            snap = await coord.snapshot()
+            assert snap.components["c"].waiting == 3
+        finally:
+            await holder.__aexit__(None, None, None)
+        # First waiter takes the permit; the rest remain queued.
+        await asyncio.sleep(0.05)
+        snap = await coord.snapshot()
+        assert snap.components["c"].waiting == 2
+        for w in waiters:
+            w.cancel()
+        await asyncio.gather(*waiters, return_exceptions=True)
+
+    async def test_waiting_returns_to_zero_on_timeout(self) -> None:
+        coord = BackpressureCoordinator()
+        coord.register(ComponentBudget(name="c", max_concurrent=1))
+        holder = await coord.acquire("c").__aenter__()
+        try:
+            slot = coord.acquire("c", timeout=0.05)
+            with pytest.raises(BackpressureError):
+                await slot.__aenter__()
+            # Timeout path must also decrement the waiting counter.
+            snap = await coord.snapshot()
+            assert snap.components["c"].waiting == 0
+        finally:
+            await holder.__aexit__(None, None, None)
+
+    async def test_snapshot_to_dict_includes_waiting(self) -> None:
+        coord = BackpressureCoordinator()
+        coord.register(ComponentBudget(name="c", max_concurrent=2))
+        async with coord.acquire("c"):
+            snap = await coord.snapshot()
+            data = snap.to_dict()
+            assert "waiting" in data["components"]["c"]
+            assert data["components"]["c"]["waiting"] == 0
+
+
+# ===========================================================================
 # Helpers
 # ===========================================================================
 

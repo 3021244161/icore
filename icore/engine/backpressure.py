@@ -80,7 +80,16 @@ class ComponentBudget:
 
 @dataclass
 class ComponentStatus:
-    """Live status of one component."""
+    """Live status of one component.
+
+    Attributes:
+        waiting: Number of ``acquire`` calls currently queued for a
+            permit (ICORE-ISSUE-006 "waiting queue depth"). Callers
+            driving degradation off queue depth (e.g. "waiting > 50")
+            read this from ``snapshot()`` / ``/health``. ``0`` when no
+            one is waiting; a fast-path acquire that never yields does
+            not show up here.
+    """
 
     name: str
     max_concurrent: int
@@ -89,6 +98,7 @@ class ComponentStatus:
     rate_limited: bool
     saturated: bool
     last_saturation: Optional[float] = None
+    waiting: int = 0
 
 
 @dataclass
@@ -113,6 +123,7 @@ class BackpressureSnapshot:
                     "available": s.available,
                     "rate_limited": s.rate_limited,
                     "saturated": s.saturated,
+                    "waiting": s.waiting,
                 }
                 for name, s in self.components.items()
             },
@@ -132,6 +143,10 @@ class _ComponentLimiter:
         self._sem = asyncio.Semaphore(budget.max_concurrent)
         self._active = 0
         self._lock = asyncio.Lock()
+        # ICORE-ISSUE-006: 等待队列深度——正在排队获取许可的 acquire
+        # 调用数。asyncio.Semaphore 的等待者对外不可见，故在 acquire
+        # 路径自行维护（进入等待 +1，获得许可或超时/取消 -1）。
+        self._waiting = 0
         # Token bucket state (only when rate_per_sec > 0).
         self._tokens: float = float(budget.burst) if budget.burst > 0 else 0.0
         self._last_refill = time.time()
@@ -149,17 +164,25 @@ class _ComponentLimiter:
             await self._consume_tokens(n)
 
         # 2. Concurrency cap.
-        if timeout is None:
-            await self._sem.acquire()
-        else:
-            try:
-                await asyncio.wait_for(self._sem.acquire(), timeout=timeout)
-            except asyncio.TimeoutError as e:
-                self._mark_saturation()
-                raise BackpressureError(
-                    f"Component '{self.budget.name}' saturated "
-                    f"(no permit within {timeout}s)"
-                ) from e
+        # ICORE-ISSUE-006: the waiting counter is incremented for the
+        # whole acquire (a permit-available fast path never yields the
+        # event loop, so the transient +1/-1 is unobservable there);
+        # finally covers the permit, timeout and cancellation paths.
+        self._waiting += 1
+        try:
+            if timeout is None:
+                await self._sem.acquire()
+            else:
+                try:
+                    await asyncio.wait_for(self._sem.acquire(), timeout=timeout)
+                except asyncio.TimeoutError as e:
+                    self._mark_saturation()
+                    raise BackpressureError(
+                        f"Component '{self.budget.name}' saturated "
+                        f"(no permit within {timeout}s)"
+                    ) from e
+        finally:
+            self._waiting -= 1
 
         async with self._lock:
             self._active += 1
@@ -215,6 +238,7 @@ class _ComponentLimiter:
             rate_limited=self.budget.rate_per_sec > 0,
             saturated=active >= self.budget.max_concurrent,
             last_saturation=self._last_saturation,
+            waiting=self._waiting,
         )
 
 

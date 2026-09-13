@@ -32,9 +32,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Optional
 
 from icore.exceptions import CircuitBreakerOpenError
 
@@ -54,10 +55,39 @@ class CircuitBreaker:
     """
     Per-resource circuit breaker.
 
+    Two CLOSED-state trip criteria are supported (ICORE-ISSUE-006):
+
+        - **Consecutive-failure mode** (default): trips when
+          ``failure_count >= failure_threshold``. Legacy behavior,
+          unchanged and zero overhead (no samples recorded) when
+          ``failure_rate_threshold`` is ``None``.
+        - **Windowed-failure-rate mode** (optional): when
+          ``failure_rate_threshold`` is set, the CLOSED-state trip
+          criterion switches to "failure rate within the sliding
+          ``failure_rate_window`` **reaches or exceeds** the threshold,
+          with at least ``min_samples`` observations in the window".
+          ``min_samples`` guards against small-sample false trips;
+          the windowed rate is far more robust to traffic bursts than
+          consecutive counting (a handful of failures during a
+          low-traffic period no longer trips the breaker).
+
+    HALF_OPEN semantics (probe successes close, any probe failure
+    re-opens) are identical in both modes.
+
     Attributes:
         name:                       Identifier (usually model_id).
         failure_threshold:          Consecutive failures in CLOSED that
-                                    trip the breaker.
+                                    trip the breaker (consecutive mode
+                                    only; ignored in rate mode).
+        failure_rate_threshold:    Optional failure-rate threshold in
+                                    ``(0, 1]`` (e.g. ``0.8``). ``None``
+                                    keeps the consecutive-failure
+                                    semantics (default).
+        failure_rate_window:       Sliding window length in seconds for
+                                    rate mode (default 30).
+        min_samples:                Minimum observations required in the
+                                    window before the rate can trip the
+                                    breaker (default 10).
         recovery_timeout:           Seconds OPEN waits before HALF_OPEN.
         half_open_max_requests:     Successful probes in HALF_OPEN that
                                     transition back to CLOSED.
@@ -77,7 +107,33 @@ class CircuitBreaker:
     last_failure_time: float = 0.0
     half_open_successes: int = 0
     half_open_failures: int = 0
+    # ICORE-ISSUE-006: 可选「时间窗失败率」触发口径。None = 既有
+    # 连续计数语义（零开销，不记录样本）；设置后 CLOSED 态触发判定
+    # 切换为窗口失败率 >= 阈值（样本数达到 min_samples 才参与判定）。
+    # 刻意放在既有字段之后：位置参数顺序对既有调用方完全不变。
+    failure_rate_threshold: Optional[float] = None
+    failure_rate_window: float = 30.0
+    min_samples: int = 10
+    _samples: deque = field(default_factory=deque, repr=False)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.failure_rate_threshold is not None and not (
+            0 < self.failure_rate_threshold <= 1
+        ):
+            raise ValueError(
+                "failure_rate_threshold must be in (0, 1] or None, "
+                f"got {self.failure_rate_threshold!r}"
+            )
+        if self.failure_rate_window <= 0:
+            raise ValueError(
+                "failure_rate_window must be > 0 (seconds), "
+                f"got {self.failure_rate_window!r}"
+            )
+        if self.min_samples < 1:
+            raise ValueError(
+                f"min_samples must be >= 1, got {self.min_samples!r}"
+            )
 
     async def call(
         self,
@@ -140,11 +196,23 @@ class CircuitBreaker:
             elif self.state == CircuitState.CLOSED:
                 # Reset on any success to require *consecutive* failures.
                 self.failure_count = 0
+                # ICORE-ISSUE-006: 成功样本稀释窗口失败率。样本凑满
+                # min_samples 的瞬间可能恰好是成功调用，故此处同样
+                # 判定（语义：窗口失败率达到阈值即熔断，无论末样本）。
+                self._record_sample(False)
+                if self._should_trip():
+                    self.state = CircuitState.OPEN
+                    logger.warning(
+                        "Circuit '%s' -> OPEN (%s)",
+                        self.name,
+                        self._trip_reason(),
+                    )
 
     async def _on_failure(self) -> None:
         async with self._lock:
             self.failure_count += 1
             self.last_failure_time = time.time()
+            self._record_sample(True)
             if self.state == CircuitState.HALF_OPEN:
                 self.half_open_failures += 1
                 self.state = CircuitState.OPEN
@@ -154,18 +222,58 @@ class CircuitBreaker:
                 )
             elif (
                 self.state == CircuitState.CLOSED
-                and self.failure_count >= self.failure_threshold
+                and self._should_trip()
             ):
                 self.state = CircuitState.OPEN
                 logger.warning(
-                    "Circuit '%s' -> OPEN (%d consecutive failures)",
+                    "Circuit '%s' -> OPEN (%s)",
                     self.name,
-                    self.failure_count,
+                    self._trip_reason(),
                 )
+
+    # -- ICORE-ISSUE-006: windowed failure-rate bookkeeping --------------
+
+    def _record_sample(self, is_failure: bool) -> None:
+        """Append a ``(timestamp, outcome)`` sample (rate mode only)."""
+        if self.failure_rate_threshold is None:
+            return
+        self._samples.append((time.time(), is_failure))
+
+    def _prune_samples(self, now: float) -> None:
+        """Drop samples older than the sliding window."""
+        horizon = now - self.failure_rate_window
+        while self._samples and self._samples[0][0] <= horizon:
+            self._samples.popleft()
+
+    def _should_trip(self) -> bool:
+        """CLOSED-state trip criterion (consecutive OR windowed rate).
+
+        Consecutive mode: ``failure_count >= failure_threshold``.
+        Rate mode: windowed failure rate **>=** ``failure_rate_threshold``
+        with at least ``min_samples`` observations (else never trips).
+        """
+        if self.failure_rate_threshold is None:
+            return self.failure_count >= self.failure_threshold
+        self._prune_samples(time.time())
+        if len(self._samples) < self.min_samples:
+            return False
+        failures = sum(1 for _, failed in self._samples if failed)
+        return failures / len(self._samples) >= self.failure_rate_threshold
+
+    def _trip_reason(self) -> str:
+        if self.failure_rate_threshold is None:
+            return f"{self.failure_count} consecutive failures"
+        failures = sum(1 for _, failed in self._samples if failed)
+        return (
+            f"window failure rate "
+            f"{failures / max(len(self._samples), 1):.1%} "
+            f"({failures}/{len(self._samples)} within "
+            f"{self.failure_rate_window}s)"
+        )
 
     def snapshot(self) -> dict[str, Any]:
         """Return a JSON-friendly snapshot of breaker state."""
-        return {
+        snap: dict[str, Any] = {
             "name": self.name,
             "state": self.state.value,
             "failure_count": self.failure_count,
@@ -173,7 +281,19 @@ class CircuitBreaker:
             "half_open_failures": self.half_open_failures,
             "failure_threshold": self.failure_threshold,
             "recovery_timeout": self.recovery_timeout,
+            "failure_rate_threshold": self.failure_rate_threshold,
+            "failure_rate_window": self.failure_rate_window,
+            "min_samples": self.min_samples,
         }
+        if self.failure_rate_threshold is not None:
+            self._prune_samples(time.time())
+            failures = sum(1 for _, failed in self._samples if failed)
+            snap["window_samples"] = len(self._samples)
+            snap["window_failures"] = failures
+            snap["window_failure_rate"] = round(
+                failures / max(len(self._samples), 1), 4
+            )
+        return snap
 
 
 class CircuitBreakerRegistry:
@@ -196,11 +316,18 @@ class CircuitBreakerRegistry:
         failure_threshold: int = 5,
         recovery_timeout: float = 30.0,
         half_open_max_requests: int = 3,
+        failure_rate_threshold: Optional[float] = None,
+        failure_rate_window: float = 30.0,
+        min_samples: int = 10,
     ) -> None:
         self._breakers: dict[str, CircuitBreaker] = {}
         self._failure_threshold = failure_threshold
         self._recovery_timeout = recovery_timeout
         self._half_open_max_requests = half_open_max_requests
+        # ICORE-ISSUE-006: 透传可选「时间窗失败率」口径给新建 breaker。
+        self._failure_rate_threshold = failure_rate_threshold
+        self._failure_rate_window = failure_rate_window
+        self._min_samples = min_samples
         self._lock = asyncio.Lock()
 
     async def get(self, name: str) -> CircuitBreaker:
@@ -212,6 +339,9 @@ class CircuitBreakerRegistry:
                     failure_threshold=self._failure_threshold,
                     recovery_timeout=self._recovery_timeout,
                     half_open_max_requests=self._half_open_max_requests,
+                    failure_rate_threshold=self._failure_rate_threshold,
+                    failure_rate_window=self._failure_rate_window,
+                    min_samples=self._min_samples,
                 )
             return self._breakers[name]
 
