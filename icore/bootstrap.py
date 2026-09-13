@@ -13,11 +13,15 @@ for testability; this module supplies the production wiring.
 
 Configuration sources (precedence, highest last):
     1. Built-in defaults (``icore.config.Settings``)
-    2. ``.env`` file
+    2. ``.env`` file (cwd-relative, read-only)
     3. Environment variables (``ICORE_*`` prefix)
     4. YAML files in ``settings.config_dir`` (``models.yaml``,
        ``databases.yaml``) — values may reference env vars via
-       ``${VAR}`` placeholders, which are interpolated at load time.
+       ``${VAR}`` placeholders, which are interpolated at load time
+       against ``os.environ`` plus the read-only ``.env`` view
+       (ICORE-ISSUE-004: the ``.env`` file is **never** written into
+       ``os.environ``, so importing ``icore.api`` has no environment
+       side effects).
 
 The YAML ``models:`` section uses the dict key as ``model_id``::
 
@@ -58,16 +62,26 @@ _ENV_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)\}")
 # YAML loading with ${VAR} interpolation
 # ---------------------------------------------------------------------------
 
-def _interpolate(value: Any) -> Any:
-    """Recursively replace ``${VAR}`` placeholders with env values."""
+def _interpolate(
+    value: Any,
+    env: Optional[dict[str, str]] = None,
+) -> Any:
+    """Recursively replace ``${VAR}`` placeholders with env values.
+
+    ``env`` defaults to ``os.environ``. ``load_yaml_config`` passes a
+    merged read-only view (``.env`` file + process environment) so
+    placeholders resolve without ever writing into ``os.environ``
+    (ICORE-ISSUE-004).
+    """
     if isinstance(value, str):
+        source = os.environ if env is None else env
         return _ENV_PATTERN.sub(
-            lambda m: os.environ.get(m.group(1), ""), value
+            lambda m: source.get(m.group(1), ""), value
         )
     if isinstance(value, dict):
-        return {k: _interpolate(v) for k, v in value.items()}
+        return {k: _interpolate(v, env) for k, v in value.items()}
     if isinstance(value, list):
-        return [_interpolate(v) for v in value]
+        return [_interpolate(v, env) for v in value]
     return value
 
 
@@ -78,19 +92,39 @@ def load_yaml_config(path: str | Path) -> dict[str, Any]:
     Returns an empty dict if the file does not exist or PyYAML is not
     installed. Non-dict YAML documents are also returned as ``{}``.
 
-    ``${VAR}`` placeholders are resolved against ``os.environ``; to make
-    a local ``.env`` file work for these placeholders, this function
-    first calls ``dotenv.load_dotenv()`` (lazy import, no-op when
-    python-dotenv is not installed).
+    ``${VAR}`` placeholders resolve against the union of a local
+    ``.env`` file and the process environment (env vars take
+    precedence), matching the previous ``load_dotenv(override=False)``
+    semantics.
+
+    v0.6.x (ICORE-ISSUE-004): the ``.env`` file is resolved from the
+    **current working directory** and read **read-only** via
+    ``dotenv_values()`` — it is never written into ``os.environ``.
+    Importing ``icore.api.*`` therefore no longer has environment side
+    effects. (Previously ``load_dotenv()`` silently exported every
+    missing key from the located ``.env`` into the process environment,
+    breaking consumer config isolation and test reproducibility; and
+    its ``find_dotenv()`` stack-walk resolved a different file
+    depending on tooling such as ``coverage``.)
     """
-    # Ensure a local .env file is loaded into os.environ so that
-    # ${VAR} placeholders in YAML resolve (e.g. API keys).
+    # ICORE-ISSUE-004: .env 只读参与 ${VAR} 插值，绝不写入 os.environ。
+    # 旧实现在 import 链上（api/main.py 模块级 app 构建）调用 load_dotenv()
+    # 把 .env 的所有缺失键静默注入进程环境；且 find_dotenv() 按调用栈
+    # 定位文件、结果不确定。现改为 cwd 相对路径 + dotenv_values 只读合并。
+    file_env: dict[str, str] = {}
     try:
-        from dotenv import load_dotenv  # type: ignore
+        from dotenv import dotenv_values  # type: ignore
     except ImportError:
         pass
     else:
-        load_dotenv()
+        try:
+            file_env = {
+                k: v
+                for k, v in dotenv_values(".env").items()
+                if v is not None
+            }
+        except Exception:  # noqa: BLE001 — .env 读取失败不阻断配置装载
+            file_env = {}
 
     p = Path(path)
     if not p.exists():
@@ -105,7 +139,8 @@ def load_yaml_config(path: str | Path) -> dict[str, Any]:
         data = yaml.safe_load(f) or {}
     if not isinstance(data, dict):
         return {}
-    return _interpolate(data)
+    # 进程环境变量优先于 .env 文件值（等价旧 load_dotenv 的 override=False）。
+    return _interpolate(data, {**file_env, **dict(os.environ)})
 
 
 # ---------------------------------------------------------------------------

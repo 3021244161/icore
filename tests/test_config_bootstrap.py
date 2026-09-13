@@ -8,6 +8,9 @@ Covers:
     - get_settings() singleton caching
     - bootstrap._interpolate (recursive ${VAR} replacement)
     - bootstrap.load_yaml_config (file loading + env interpolation)
+    - bootstrap.load_yaml_config read-only .env semantics and the
+      import-isolation regression (ICORE-ISSUE-004: importing icore.api.*
+      must never write the .env file into os.environ)
     - bootstrap.build_model_manager (from YAML, routing rules, default id)
     - bootstrap.build_db_manager (from YAML, named connections)
     - bootstrap.autoregister_workflows (module import + registry population)
@@ -17,6 +20,8 @@ Covers:
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 import textwrap
 from pathlib import Path
 from typing import Any
@@ -281,6 +286,142 @@ class TestLoadYamlConfig:
         f.write_text("- a\n- b\n", encoding="utf-8")
         from icore.bootstrap import load_yaml_config
         assert load_yaml_config(f) == {}
+
+
+# ---------------------------------------------------------------------------
+# ICORE-ISSUE-004: read-only .env + import isolation
+# ---------------------------------------------------------------------------
+
+class TestLoadYamlConfigReadOnlyEnv:
+    """load_yaml_config 的 .env 只读语义（ICORE-ISSUE-004）。"""
+
+    def test_dotenv_file_used_without_writing_environ(
+        self, tmp_path, monkeypatch
+    ):
+        """cwd 的 .env 参与 ${VAR} 插值，但不写入 os.environ。"""
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text(
+            "ISSUE004_FILE_KEY=from-dotenv\n", encoding="utf-8"
+        )
+        monkeypatch.delenv("ISSUE004_FILE_KEY", raising=False)
+        f = tmp_path / "cfg.yaml"
+        f.write_text(
+            textwrap.dedent(
+                """
+                models:
+                  m1:
+                    api_key: ${ISSUE004_FILE_KEY}
+                    missing: ${ISSUE004_NOT_DEFINED}
+                """
+            ).strip(),
+            encoding="utf-8",
+        )
+
+        from icore.bootstrap import load_yaml_config
+
+        data = load_yaml_config(f)
+
+        assert data["models"]["m1"]["api_key"] == "from-dotenv"
+        # 缺失变量 -> 空串（保持既有插值行为）
+        assert data["models"]["m1"]["missing"] == ""
+        # 核心回归断言：键未被注入进程环境
+        assert "ISSUE004_FILE_KEY" not in os.environ
+
+    def test_environ_takes_precedence_over_dotenv_file(
+        self, tmp_path, monkeypatch
+    ):
+        """进程环境变量优先于 .env 文件值（等价旧 override=False 语义）。"""
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text(
+            "ISSUE004_PREC_KEY=from-dotenv\n", encoding="utf-8"
+        )
+        monkeypatch.setenv("ISSUE004_PREC_KEY", "from-environ")
+        f = tmp_path / "cfg.yaml"
+        f.write_text("value: ${ISSUE004_PREC_KEY}\n", encoding="utf-8")
+
+        from icore.bootstrap import load_yaml_config
+
+        data = load_yaml_config(f)
+
+        assert data["value"] == "from-environ"
+
+    def test_missing_dotenv_file_still_interpolates_environ(
+        self, tmp_path, monkeypatch
+    ):
+        """无 .env 文件时退回纯 os.environ 插值（dotenv 未装等价路径）。"""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("ISSUE004_ENV_ONLY", "env-value")
+        f = tmp_path / "cfg.yaml"
+        f.write_text("value: ${ISSUE004_ENV_ONLY}\n", encoding="utf-8")
+
+        from icore.bootstrap import load_yaml_config
+
+        data = load_yaml_config(f)
+
+        assert data["value"] == "env-value"
+
+
+class TestImportEnvIsolation:
+    """import icore.api.* 不得污染进程环境（ICORE-ISSUE-004 回归）。
+
+    子进程级验证：干净解释器中 import 一个纯内存模块
+    ``icore.api.idempotency``，断言 import 前后 os.environ 的**新增键**
+    不含任何候选 .env（cwd 的与 icore 包根的）中定义的键。
+    """
+
+    def _run_import_probe(self, cwd: Path) -> tuple[int, str, str]:
+        import icore
+
+        icore_root = Path(icore.__file__).resolve().parents[1]
+        code = (
+            "import os\n"
+            "before = set(os.environ)\n"
+            "import icore.api.idempotency\n"
+            "after = set(os.environ)\n"
+            "added = after - before\n"
+            "from pathlib import Path\n"
+            "import icore\n"
+            "candidates = [Path.cwd() / '.env',\n"
+            "             Path(icore.__file__).resolve().parents[1] / '.env']\n"
+            "envkeys = set()\n"
+            "try:\n"
+            "    from dotenv import dotenv_values\n"
+            "    for c in candidates:\n"
+            "        if c.exists():\n"
+            "            envkeys |= {k for k, v in dotenv_values(c).items()\n"
+            "                        if v is not None}\n"
+            "except ImportError:\n"
+            "    pass\n"
+            "leaked = sorted(added & envkeys)\n"
+            "assert not leaked, 'POLLUTED: %s' % leaked\n"
+            "print('CLEAN')\n"
+        )
+        env = {**os.environ, "PYTHONPATH": str(icore_root)}
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=str(cwd),
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        return proc.returncode, proc.stdout, proc.stderr
+
+    def test_import_with_cwd_dotenv_does_not_export_keys(self, tmp_path):
+        """zGo 场景：使用方项目根有 .env（含密钥），import 后不得注入。"""
+        (tmp_path / ".env").write_text(
+            "ISSUE004_SUBPROC_SENTINEL=leaked-secret\n", encoding="utf-8"
+        )
+        rc, out, err = self._run_import_probe(tmp_path)
+
+        assert rc == 0, err
+        assert "CLEAN" in out
+
+    def test_import_without_cwd_dotenv_still_clean(self, tmp_path):
+        """cwd 无 .env 时同样干净（icore-design 根 .env 也不得注入）。"""
+        rc, out, err = self._run_import_probe(tmp_path)
+
+        assert rc == 0, err
+        assert "CLEAN" in out
 
 
 # ---------------------------------------------------------------------------
