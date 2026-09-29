@@ -1,4 +1,4 @@
-# icore — 企业级 LLM 工作流编排平台
+# icore — 工作流编排平台
 
 **Coding-Driven Workflow Orchestration Platform**
 
